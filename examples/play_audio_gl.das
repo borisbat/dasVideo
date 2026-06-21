@@ -6,7 +6,8 @@ options gen2
 // the file has no audio (or --mute) the loop falls back to wall-clock pacing.
 // Windowed + needs an audio device, so it is run locally / by hand, not in CI.
 //
-//   daslang -load_module <repo> examples/play_audio_gl.das -- --video clip.mpg
+//   daslang -load_module <repo> examples/play_audio_gl.das    # Emma introduces dasVideo (default)
+//   ... --video clip.mpg   play your own MPEG-1/MP2 file instead
 //   ... --mute          ignore the audio track, pace by wall-clock
 //   ... --max-frames N  auto-exit after N render iterations (local smoke)
 //   ... --shot out.png  write the first displayed frame to a PNG
@@ -31,7 +32,7 @@ let AUDIO_TARGET_CHUNKS = 8
 struct PlayArgs {
     @clarg_short = "f"
     @clarg_doc = "Video file to play (MPEG-1 .mpg with MP2 audio)"
-    video : string = "tests/fixtures/test_audio.mpg"
+    video : string = "assets/emma/emma_intro.mpg"
 
     @clarg_doc = "Ignore the audio track; pace video by wall-clock"
     mute : bool
