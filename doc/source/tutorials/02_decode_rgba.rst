@@ -7,6 +7,8 @@ pixels are then **borrowed** inside a ``get_data`` block — a view that's valid
 inside the block and only until the next decode, and is never copied. That borrow
 is the heart of dasVideo's "player owns, consumer borrows" model.
 
+.. video:: 02_decode_rgba.mp4
+
 The library
 -----------
 
@@ -57,5 +59,5 @@ prints::
 Next
 ----
 
-The next tutorial puts those borrowed pixels on screen: upload the RGBA frame to an
+:doc:`03_rgba_gl` puts those borrowed pixels on screen: upload the RGBA frame to an
 OpenGL texture and draw it on a fullscreen quad in a window.
