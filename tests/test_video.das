@@ -20,6 +20,7 @@ def main() {
         frames++
         p |> get_data() $(rgb : array<uint8>#) {
             verify(length(rgb) == 64 * 48 * 4, "RGBA buffer is width*height*4")
+            verify(rgb[3] == 255u8, "RGBA frames are opaque (alpha = 255)")
             for (b in rgb) {
                 rgba_checksum += uint(b)
             }
@@ -35,6 +36,16 @@ def main() {
     }
     verify(frames > 0, "should decode at least one frame")
     verify(rgba_checksum > 0u, "decoded pixels should be non-zero")
+
+    // exercise video_rewind: the loop above ran to end-of-stream; after a rewind we
+    // should decode the whole stream again from the start.
+    video_rewind(p)
+    var replayed = 0
+    while (video_decode(p)) {
+        replayed++
+    }
+    verify(replayed == frames, "video_rewind replays the full stream")
+
     video_close(p)
     print("dasVideo P1: decoded {frames} frames, rgba checksum {rgba_checksum}\n")
 }

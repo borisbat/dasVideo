@@ -31,8 +31,19 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## P2 — GL output
 
-- [ ] `examples/play_rgba_gl` — 1 texture, fullscreen quad
+- [x] `examples/play_rgba_gl` — RGBA → one texture, fullscreen quad; clargs CLI,
+      loop-by-default (`--noloop`/`--max-frames`/`--scale`/`--shot`). Visually verified
+      (test pattern renders in a window). Surfaced + fixed an opaque-alpha bug in the
+      RGBA converter along the way.
 - [ ] `examples/play_yuv_gl` — 3×`GL_R8` textures + YUV→RGB fragment shader
+
+### Follow-ups
+
+- [ ] **daslang teardown crash** (not dasVideo): clargs early-exit (e.g. `--help`) +
+      the full multi-module GL example stack → `g_envTotal=1 at exit (Initialize/Shutdown
+      not balanced)`. Normal playback exits clean. Isolated — clargs / glfw / stbimage /
+      dasVideo are each individually fine; only the combined stack trips it. A daslang
+      module Init/Shutdown accounting bug to chase upstream.
 
 ## P3 — Audio + sync
 
