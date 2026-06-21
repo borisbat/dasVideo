@@ -17,4 +17,5 @@ through RAII block accessors; **audio is the master clock** and video is paced t
    :maxdepth: 2
 
    usage
+   tutorials/index
    reference
