@@ -20,7 +20,7 @@ def main() {
         frames++
         p |> get_data() $(rgb : array<uint8>#) {
             verify(length(rgb) == 64 * 48 * 4, "RGBA buffer is width*height*4")
-            verify(rgb[3] == 255u, "RGBA frames are opaque (alpha = 255)")
+            verify(rgb[3] == 255u8, "RGBA frames are opaque (alpha = 255)")
             for (b in rgb) {
                 rgba_checksum += uint(b)
             }

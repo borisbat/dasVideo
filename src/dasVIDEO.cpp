@@ -90,10 +90,13 @@ static void video_get_data_rgba(VideoPlayer * p,
         Context * context, LineInfoArg * at) {
     if ( !p || !p->frame ) return;
     const size_t need = size_t(p->frame->width) * p->frame->height * 4;
-    if ( p->rgba.size() != need ) p->rgba.resize(need);
-    // plm_frame_to_rgba writes R/G/B but not the alpha byte; pre-fill 0xFF so the
-    // frame is opaque (the convert overwrites only RGB).
-    memset(p->rgba.data(), 0xFF, p->rgba.size());
+    if ( p->rgba.size() != need ) {
+        p->rgba.resize(need);
+        // plm_frame_to_rgba writes R/G/B but never the alpha byte; fill 0xFF once
+        // per (re)alloc so frames are opaque. The convert overwrites only RGB, so
+        // alpha stays 0xFF across frames — no need to refill every frame.
+        memset(p->rgba.data(), 0xFF, p->rgba.size());
+    }
     plm_frame_to_rgba(p->frame, p->rgba.data(), int(p->frame->width) * 4);
     Array arr;
     array_mark_locked(arr, p->rgba.data(), uint64_t(p->rgba.size()));

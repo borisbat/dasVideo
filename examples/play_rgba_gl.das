@@ -139,6 +139,10 @@ def main : int {
     defer() { video_close(player) }
     let vw = video_width(player)
     let vh = video_height(player)
+    if (vw <= 0 || vh <= 0) {
+        print("no decodable video stream in: {cfg.video}\n")
+        return 1
+    }
 
     if (glfwInit() == 0) {
         print("can't init glfw\n")
