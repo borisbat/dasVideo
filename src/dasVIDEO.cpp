@@ -1,12 +1,20 @@
-// dasVideo native module — pl_mpeg video + audio decode.
+// dasVideo native module — pluggable decode backends behind one daslang surface.
 //
-// Opens an MPEG-1 (.mpg) stream and decodes video frames + MP2 audio. pl_mpeg
-// (MIT) is compiled into this TU. The player owns the decoder + a reused RGBA
-// convert buffer; the consumer borrows per-frame pixels and per-batch audio
+// A VideoPlayer owns a polymorphic VideoSource (the decode backend) plus a reused
+// RGBA convert buffer; the consumer borrows per-frame pixels and per-batch audio
 // through `get_data` / `get_audio_data` block accessors (RAII temp views, valid
 // only inside the block) — the "player owns, consumer borrows" model from
-// ORIGINAL_PLAN.md. Audio is opt-in (video_enable_audio) so the video-only paths
-// stay zero-overhead; A/V sync is driven in das (audio is the master clock).
+// ORIGINAL_PLAN.md. video_open probes the file and constructs the matching
+// backend, so the daslang API never names the codec.
+//
+// Backends:
+//   PlmSource  — pl_mpeg (MIT), MPEG-1 video + MP2 audio, compiled into this TU.
+//   (dav1d/AV1 backend slots in beside it behind the same VideoSource — P5.)
+//
+// Common denominator across backends (ORIGINAL_PLAN): video = YUV 4:2:0 8-bit
+// planes + pts; audio = interleaved float32 PCM + rate + pts. Audio is opt-in
+// (video_enable_audio) so video-only paths stay zero-overhead; A/V sync is driven
+// in das (audio is the master clock).
 #include "daScript/daScript.h"
 #include "daScript/ast/ast_handle.h"
 
@@ -18,12 +26,135 @@
 
 namespace das {
 
-struct VideoPlayer {
+// ===== backend interface =====
+
+// Borrowed view of the current decoded frame's native YUV 4:2:0 planes. Each plane
+// is packed at its own row stride (the allocated plane width, macroblock-rounded);
+// the display size is VideoSource::width()/height(). Valid until the next decode.
+struct VideoFrameView {
+    const uint8_t * y = nullptr, * cb = nullptr, * cr = nullptr;
+    int yW = 0, yH = 0;   // Y plane stride (packed width) + height
+    int cW = 0, cH = 0;   // chroma plane stride (packed width) + height
+    double pts = 0.0;
+};
+
+// Borrowed view of the current decoded audio batch — interleaved float PCM. count
+// is frames-per-channel, so the buffer is count*channels floats. Valid until the
+// next decode.
+struct AudioBatchView {
+    const float * interleaved = nullptr;
+    int count = 0;
+    double pts = 0.0;
+};
+
+// A decode backend. One concrete impl per container/codec; video_open picks one by
+// probing the file. The player drives it and borrows its current frame / audio.
+struct VideoSource {
+    virtual ~VideoSource() {}
+    // stream info (valid right after open)
+    virtual int    width() const = 0;
+    virtual int    height() const = 0;
+    virtual double framerate() const = 0;
+    virtual int    samplerate() const = 0;
+    virtual double duration() const = 0;
+    virtual bool   ended() const = 0;
+    // video
+    virtual bool decodeVideo() = 0;                          // advance one frame; false at end of stream
+    virtual bool currentFrame(VideoFrameView & v) const = 0; // borrow the current frame's planes
+    // Convert the current frame to packed RGBA8 into dst at dstStride bytes/row.
+    // Writes R/G/B only; the caller pre-fills the buffer opaque (alpha untouched).
+    virtual void convertRgba(uint8_t * dst, int dstStride) const = 0;
+    virtual void rewind() = 0;
+    // audio (opt-in)
+    virtual bool hasAudio() const = 0;
+    virtual bool enableAudio() = 0;
+    virtual int  audioChannels() const = 0;
+    virtual bool decodeAudio() = 0;                          // advance one batch; false when none
+    virtual bool currentAudio(AudioBatchView & a) const = 0;
+};
+
+// ===== pl_mpeg backend =====
+
+struct PlmSource final : VideoSource {
     plm_t * plm = nullptr;
-    plm_frame_t * frame = nullptr;      // last decoded frame; borrowed from plm, valid until next decode
-    plm_samples_t * samples = nullptr;  // last decoded audio batch; borrowed from plm, valid until next plm_decode_audio
-    std::vector<uint8_t> rgba;          // player-owned RGBA convert target, reused per frame
-    bool ended = false;
+    plm_frame_t * frame = nullptr;      // current frame; borrowed from plm until next decode
+    plm_samples_t * samples = nullptr;  // current audio batch; borrowed until next plm_decode_audio
+    bool endedFlag = false;
+
+    // Try to open filename as an MPEG-1 stream; null if pl_mpeg can't (lets
+    // video_open fall through to another backend).
+    static PlmSource * tryOpen(const char * filename) {
+        plm_t * plm = plm_create_with_filename(filename);
+        if ( !plm ) return nullptr;
+        plm_set_audio_enabled(plm, 0);  // audio is opt-in (video_enable_audio)
+        auto * s = new PlmSource();
+        s->plm = plm;
+        return s;
+    }
+    ~PlmSource() override { if ( plm ) plm_destroy(plm); }
+
+    int    width() const override      { return plm ? plm_get_width(plm) : 0; }
+    int    height() const override     { return plm ? plm_get_height(plm) : 0; }
+    double framerate() const override  { return plm ? plm_get_framerate(plm) : 0.0; }
+    int    samplerate() const override { return plm ? plm_get_samplerate(plm) : 0; }
+    double duration() const override   { return plm ? plm_get_duration(plm) : 0.0; }
+    bool   ended() const override      { return !plm ? true : (endedFlag || plm_has_ended(plm) != 0); }
+
+    bool decodeVideo() override {
+        if ( !plm ) return false;
+        frame = plm_decode_video(plm);
+        if ( !frame ) { endedFlag = true; return false; }
+        return true;
+    }
+    bool currentFrame(VideoFrameView & v) const override {
+        if ( !frame ) return false;
+        v.y  = frame->y.data;  v.yW = int(frame->y.width);  v.yH = int(frame->y.height);
+        v.cb = frame->cb.data; v.cr = frame->cr.data;
+        v.cW = int(frame->cb.width); v.cH = int(frame->cb.height);
+        v.pts = frame->time;
+        return true;
+    }
+    void convertRgba(uint8_t * dst, int dstStride) const override {
+        if ( frame ) plm_frame_to_rgba(frame, dst, dstStride);
+    }
+    void rewind() override {
+        if ( !plm ) return;
+        plm_rewind(plm);
+        endedFlag = false; frame = nullptr; samples = nullptr;
+    }
+    bool hasAudio() const override { return plm ? plm_get_num_audio_streams(plm) > 0 : false; }
+    bool enableAudio() override {
+        if ( !plm || plm_get_num_audio_streams(plm) <= 0 ) return false;
+        plm_set_audio_stream(plm, 0);
+        plm_set_audio_enabled(plm, 1);
+        return true;
+    }
+    int audioChannels() const override { return 2; }  // pl_mpeg always decodes interleaved stereo
+    bool decodeAudio() override {
+        if ( !plm ) return false;
+        samples = plm_decode_audio(plm);
+        return samples != nullptr;
+    }
+    bool currentAudio(AudioBatchView & a) const override {
+        if ( !samples ) return false;
+        a.interleaved = samples->interleaved;
+        a.count = int(samples->count);
+        a.pts = samples->time;
+        return true;
+    }
+};
+
+// Format dispatch. P5+ probes magic bytes here (AV1/WebM) and returns the matching
+// backend; for now pl_mpeg is the only one.
+static VideoSource * createSourceFor(const char * filename) {
+    return PlmSource::tryOpen(filename);
+}
+
+// ===== player (backend-agnostic) =====
+
+struct VideoPlayer {
+    VideoSource * src = nullptr;
+    std::vector<uint8_t> rgba;   // player-owned RGBA convert target, reused per frame
 };
 
 }
@@ -36,94 +167,98 @@ namespace das {
 
 static VideoPlayer * video_open(const char * filename) {
     if ( !filename || !*filename ) return nullptr;
-    plm_t * plm = plm_create_with_filename(filename);
-    if ( !plm ) return nullptr;
-    plm_set_audio_enabled(plm, 0);      // P1: video only; audio is P3
+    VideoSource * src = createSourceFor(filename);
+    if ( !src ) return nullptr;
     auto * p = new VideoPlayer();
-    p->plm = plm;
+    p->src = src;
     return p;
 }
 
 static void video_close(VideoPlayer * p) {
     if ( !p ) return;
-    if ( p->plm ) plm_destroy(p->plm);
+    delete p->src;
     delete p;
 }
 
 // ===== info =====
 
-static int32_t video_width(VideoPlayer * p)      { return (p && p->plm) ? plm_get_width(p->plm) : 0; }
-static int32_t video_height(VideoPlayer * p)     { return (p && p->plm) ? plm_get_height(p->plm) : 0; }
-static double  video_framerate(VideoPlayer * p)  { return (p && p->plm) ? plm_get_framerate(p->plm) : 0.0; }
-static int32_t video_samplerate(VideoPlayer * p) { return (p && p->plm) ? plm_get_samplerate(p->plm) : 0; }
-static double  video_duration(VideoPlayer * p)   { return (p && p->plm) ? plm_get_duration(p->plm) : 0.0; }
-static double  video_frame_time(VideoPlayer * p) { return (p && p->frame) ? p->frame->time : 0.0; }
-static bool    video_has_ended(VideoPlayer * p)  { return (!p || !p->plm) ? true : (p->ended || plm_has_ended(p->plm) != 0); }
+static int32_t video_width(VideoPlayer * p)      { return (p && p->src) ? p->src->width() : 0; }
+static int32_t video_height(VideoPlayer * p)     { return (p && p->src) ? p->src->height() : 0; }
+static double  video_framerate(VideoPlayer * p)  { return (p && p->src) ? p->src->framerate() : 0.0; }
+static int32_t video_samplerate(VideoPlayer * p) { return (p && p->src) ? p->src->samplerate() : 0; }
+static double  video_duration(VideoPlayer * p)   { return (p && p->src) ? p->src->duration() : 0.0; }
+static bool    video_has_ended(VideoPlayer * p)  { return (p && p->src) ? p->src->ended() : true; }
 
+static double video_frame_time(VideoPlayer * p) {
+    VideoFrameView v;
+    return (p && p->src && p->src->currentFrame(v)) ? v.pts : 0.0;
+}
 // Plane strides (== tightly-packed plane widths, macroblock-rounded) for the YUV
 // route; display size is video_width/height.
-static int32_t video_y_stride(VideoPlayer * p)   { return (p && p->frame) ? int32_t(p->frame->y.width)  : 0; }
-static int32_t video_uv_stride(VideoPlayer * p)  { return (p && p->frame) ? int32_t(p->frame->cb.width) : 0; }
+static int32_t video_y_stride(VideoPlayer * p) {
+    VideoFrameView v;
+    return (p && p->src && p->src->currentFrame(v)) ? v.yW : 0;
+}
+static int32_t video_uv_stride(VideoPlayer * p) {
+    VideoFrameView v;
+    return (p && p->src && p->src->currentFrame(v)) ? v.cW : 0;
+}
 
 // ===== decode =====
 
-// Decode the next video frame. Returns true if a frame was produced, false at
-// end of stream. The frame is held by the player until the next decode call.
+// Decode the next video frame. Returns true if a frame was produced, false at end
+// of stream. The frame is held by the player until the next decode call.
 static bool video_decode(VideoPlayer * p) {
-    if ( !p || !p->plm ) return false;
-    p->frame = plm_decode_video(p->plm);
-    if ( !p->frame ) { p->ended = true; return false; }
-    return true;
+    return (p && p->src) ? p->src->decodeVideo() : false;
 }
 
 // Rewind to the start (for looping playback).
 static void video_rewind(VideoPlayer * p) {
-    if ( !p || !p->plm ) return;
-    plm_rewind(p->plm);
-    p->ended = false;
-    p->frame = nullptr;
-    p->samples = nullptr;
+    if ( p && p->src ) p->src->rewind();
 }
 
 // ===== audio (opt-in) =====
 
 static bool video_has_audio(VideoPlayer * p) {
-    return (p && p->plm) ? plm_get_num_audio_streams(p->plm) > 0 : false;
+    return (p && p->src) ? p->src->hasAudio() : false;
 }
 
 // Enable the (first) audio stream. video_open leaves audio disabled so the
 // video-only paths never buffer audio packets; call this right after open if you
 // want sound. Returns true only if the file actually has an audio stream.
 static bool video_enable_audio(VideoPlayer * p) {
-    if ( !p || !p->plm || plm_get_num_audio_streams(p->plm) <= 0 ) return false;
-    plm_set_audio_stream(p->plm, 0);
-    plm_set_audio_enabled(p->plm, 1);
-    return true;
+    return (p && p->src) ? p->src->enableAudio() : false;
 }
 
-// pl_mpeg always decodes to interleaved stereo.
-static int32_t video_audio_channels(VideoPlayer *) { return 2; }
+static int32_t video_audio_channels(VideoPlayer * p) {
+    return (p && p->src) ? p->src->audioChannels() : 0;
+}
 
-// Decode the next audio batch (PLM_AUDIO_SAMPLES_PER_FRAME=1152 stereo frames).
-// Returns true if a batch was produced; held by the player until the next call.
+// Decode the next audio batch. Returns true if a batch was produced; held by the
+// player until the next call.
 static bool video_decode_audio(VideoPlayer * p) {
-    if ( !p || !p->plm ) return false;
-    p->samples = plm_decode_audio(p->plm);
-    return p->samples != nullptr;
+    return (p && p->src) ? p->src->decodeAudio() : false;
 }
 
-static double  video_audio_time(VideoPlayer * p)  { return (p && p->samples) ? p->samples->time : 0.0; }
-static int32_t video_audio_count(VideoPlayer * p) { return (p && p->samples) ? int32_t(p->samples->count) : 0; } // stereo frames
+static double video_audio_time(VideoPlayer * p) {
+    AudioBatchView a;
+    return (p && p->src && p->src->currentAudio(a)) ? a.pts : 0.0;
+}
+static int32_t video_audio_count(VideoPlayer * p) {  // frames per channel
+    AudioBatchView a;
+    return (p && p->src && p->src->currentAudio(a)) ? a.count : 0;
+}
 
-// Borrowed audio access: hand the decoded interleaved stereo floats (count*2)
-// to the block, valid only inside it. append_to_pcm takes ownership, so clone
-// the borrowed samples into a real array before pushing them.
+// Borrowed audio access: hand the decoded interleaved floats (count*channels) to
+// the block, valid only inside it. append_to_pcm takes ownership, so clone the
+// borrowed samples into a real array before pushing them.
 static void video_get_audio_data(VideoPlayer * p,
         const TBlock<void, TTemporary<TArray<float> const>> & block,
         Context * context, LineInfoArg * at) {
-    if ( !p || !p->samples ) return;
+    AudioBatchView a;
+    if ( !p || !p->src || !p->src->currentAudio(a) ) return;
     Array arr;
-    array_mark_locked(arr, (void *)p->samples->interleaved, uint64_t(p->samples->count) * 2);
+    array_mark_locked(arr, (void *)a.interleaved, uint64_t(a.count) * uint64_t(p->src->audioChannels()));
     vec4f args[1];
     args[0] = cast<Array *>::from(&arr);
     context->invoke(block, args, nullptr, at);
@@ -136,16 +271,18 @@ static void video_get_audio_data(VideoPlayer * p,
 static void video_get_data_rgba(VideoPlayer * p,
         const TBlock<void, TTemporary<TArray<uint8_t> const>> & block,
         Context * context, LineInfoArg * at) {
-    if ( !p || !p->frame ) return;
-    const size_t need = size_t(p->frame->width) * p->frame->height * 4;
+    VideoFrameView v;
+    if ( !p || !p->src || !p->src->currentFrame(v) ) return;
+    const int w = p->src->width(), h = p->src->height();
+    const size_t need = size_t(w) * size_t(h) * 4;
     if ( p->rgba.size() != need ) {
         p->rgba.resize(need);
-        // plm_frame_to_rgba writes R/G/B but never the alpha byte; fill 0xFF once
-        // per (re)alloc so frames are opaque. The convert overwrites only RGB, so
-        // alpha stays 0xFF across frames — no need to refill every frame.
+        // convertRgba writes R/G/B but never the alpha byte; fill 0xFF once per
+        // (re)alloc so frames are opaque. The convert overwrites only RGB, so alpha
+        // stays 0xFF across frames — no need to refill every frame.
         memset(p->rgba.data(), 0xFF, p->rgba.size());
     }
-    plm_frame_to_rgba(p->frame, p->rgba.data(), int(p->frame->width) * 4);
+    p->src->convertRgba(p->rgba.data(), w * 4);
     Array arr;
     array_mark_locked(arr, p->rgba.data(), uint64_t(p->rgba.size()));
     vec4f args[1];
@@ -154,16 +291,17 @@ static void video_get_data_rgba(VideoPlayer * p,
 }
 
 // Advanced route: hand the native YUV420p planes (Y, U=cb, V=cr) to the block,
-// zero-copy. Each plane is tightly packed at its plane.width (the stride); the
-// display size is video_width/height. Valid only inside the block.
+// zero-copy. Each plane is tightly packed at its stride (video_y_stride /
+// video_uv_stride); the display size is video_width/height. Valid only inside the block.
 static void video_get_data_yuv(VideoPlayer * p,
         const TBlock<void, TTemporary<TArray<uint8_t> const>, TTemporary<TArray<uint8_t> const>, TTemporary<TArray<uint8_t> const>> & block,
         Context * context, LineInfoArg * at) {
-    if ( !p || !p->frame ) return;
+    VideoFrameView v;
+    if ( !p || !p->src || !p->src->currentFrame(v) ) return;
     Array ay, au, av;
-    array_mark_locked(ay, p->frame->y.data,  uint64_t(p->frame->y.width)  * p->frame->y.height);
-    array_mark_locked(au, p->frame->cb.data, uint64_t(p->frame->cb.width) * p->frame->cb.height);
-    array_mark_locked(av, p->frame->cr.data, uint64_t(p->frame->cr.width) * p->frame->cr.height);
+    array_mark_locked(ay, (void *)v.y,  uint64_t(v.yW) * uint64_t(v.yH));
+    array_mark_locked(au, (void *)v.cb, uint64_t(v.cW) * uint64_t(v.cH));
+    array_mark_locked(av, (void *)v.cr, uint64_t(v.cW) * uint64_t(v.cH));
     vec4f args[3];
     args[0] = cast<Array *>::from(&ay);
     args[1] = cast<Array *>::from(&au);
