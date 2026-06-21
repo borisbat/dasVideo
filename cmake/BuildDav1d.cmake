@@ -46,11 +46,22 @@ set(DAV1D_HAVE_PTHREAD_GETAFFINITY_NP 0)
 set(DAV1D_HAVE_PTHREAD_SETAFFINITY_NP 0)
 set(DAV1D_HAVE_PTHREAD_SETNAME_NP 0)
 
-# endianness
-if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
-    set(DAV1D_ENDIANNESS_BIG 1)
+# endianness — CMAKE_C_BYTE_ORDER needs CMake >= 3.20; fall back to TestBigEndian
+# on older (we declare cmake_minimum_required 3.16).
+if(DEFINED CMAKE_C_BYTE_ORDER)
+    if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+        set(DAV1D_ENDIANNESS_BIG 1)
+    else()
+        set(DAV1D_ENDIANNESS_BIG 0)
+    endif()
 else()
-    set(DAV1D_ENDIANNESS_BIG 0)
+    include(TestBigEndian)
+    test_big_endian(DAV1D_IS_BIG_ENDIAN)
+    if(DAV1D_IS_BIG_ENDIAN)
+        set(DAV1D_ENDIANNESS_BIG 1)
+    else()
+        set(DAV1D_ENDIANNESS_BIG 0)
+    endif()
 endif()
 
 # arch

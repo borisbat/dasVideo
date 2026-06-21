@@ -24,9 +24,11 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
-#include <cerrno>
 
+#ifdef DAS_VIDEO_WITH_DAV1D
+#include <cerrno>
 #include <dav1d/dav1d.h>
+#endif
 
 namespace das {
 
@@ -95,6 +97,15 @@ struct PlmSource final : VideoSource {
         s->plm = plm;
         return s;
     }
+    // Reference the caller's bytes (free_when_done=0) — they must outlive the player.
+    static PlmSource * tryOpenMemory(const uint8_t * data, size_t size) {
+        plm_t * plm = plm_create_with_memory((uint8_t *)data, size, 0);
+        if ( !plm ) return nullptr;
+        plm_set_audio_enabled(plm, 0);
+        auto * s = new PlmSource();
+        s->plm = plm;
+        return s;
+    }
     ~PlmSource() override { if ( plm ) plm_destroy(plm); }
 
     int    width() const override      { return plm ? plm_get_width(plm) : 0; }
@@ -148,14 +159,36 @@ struct PlmSource final : VideoSource {
     }
 };
 
+#ifdef DAS_VIDEO_WITH_DAV1D
 // ===== dav1d (AV1) backend =====
 
 // Decodes an AV1 elementary stream in an IVF container (the trivial AV1 container:
 // a 32-byte file header + per-frame [size, timestamp, OBUs]). Video only — WebM +
 // Opus audio is the next phase. Tier-1 per ORIGINAL_PLAN: 8-bit 4:2:0 only;
 // 10-bit / HDR / 4:2:2 / 4:4:4 fail closed with a clear message.
-struct Av1Source final : VideoSource {
+
+// A read cursor over either a file or a borrowed in-memory buffer. The memory case
+// references the caller's bytes — they must outlive the player (no copy).
+struct ByteSource {
     FILE * fp = nullptr;
+    const uint8_t * mem = nullptr;
+    size_t size = 0, pos = 0;
+    bool read(void * dst, size_t n) {
+        if ( fp ) return fread(dst, 1, n, fp) == n;
+        if ( !mem || pos + n > size ) return false;
+        memcpy(dst, mem + pos, n);
+        pos += n;
+        return true;
+    }
+    void seekStart(size_t off) {   // absolute seek from the start (used by rewind)
+        if ( fp ) fseek(fp, long(off), SEEK_SET);
+        else pos = off;
+    }
+    void close() { if ( fp ) { fclose(fp); fp = nullptr; } mem = nullptr; }
+};
+
+struct Av1Source final : VideoSource {
+    ByteSource bs;
     Dav1dContext * ctx = nullptr;
     Dav1dData pending{};        // current packet being fed; .sz == 0 when empty
     Dav1dPicture pic{};
@@ -170,22 +203,21 @@ struct Av1Source final : VideoSource {
         return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
     }
 
-    // null (not consumed) if not an AV1 IVF, so video_open falls through to pl_mpeg.
-    static Av1Source * tryOpen(const char * filename) {
-        FILE * fp = fopen(filename, "rb");
-        if ( !fp ) return nullptr;
+    // Construct from a ready ByteSource (file or memory). Returns null (after closing
+    // bs) if it isn't an AV1 IVF, so video_open falls through to pl_mpeg.
+    static Av1Source * openFrom(ByteSource bs) {
         uint8_t hdr[32];
-        if ( fread(hdr, 1, 32, fp) != 32 ||
+        if ( !bs.read(hdr, 32) ||
              memcmp(hdr, "DKIF", 4) != 0 || memcmp(hdr + 8, "AV01", 4) != 0 ) {
-            fclose(fp);
+            bs.close();
             return nullptr;
         }
         Dav1dSettings settings;
         dav1d_default_settings(&settings);
         Dav1dContext * ctx = nullptr;
-        if ( dav1d_open(&ctx, &settings) != 0 ) { fclose(fp); return nullptr; }
+        if ( dav1d_open(&ctx, &settings) != 0 ) { bs.close(); return nullptr; }
         auto * s = new Av1Source();
-        s->fp = fp;
+        s->bs = bs;
         s->ctx = ctx;
         s->w = int(hdr[12] | (hdr[13] << 8));
         s->h = int(hdr[14] | (hdr[15] << 8));
@@ -194,22 +226,34 @@ struct Av1Source final : VideoSource {
         s->nFrames = rd32(hdr + 24);
         return s;
     }
+    static Av1Source * tryOpen(const char * filename) {
+        ByteSource bs;
+        bs.fp = fopen(filename, "rb");
+        if ( !bs.fp ) return nullptr;
+        return openFrom(bs);
+    }
+    // Reference the caller's bytes (no copy) — the buffer must outlive the player.
+    static Av1Source * tryOpenMemory(const uint8_t * data, size_t size) {
+        ByteSource bs;
+        bs.mem = data; bs.size = size; bs.pos = 0;
+        return openFrom(bs);
+    }
     ~Av1Source() override {
         if ( havePic ) dav1d_picture_unref(&pic);
         if ( pending.sz ) dav1d_data_unref(&pending);
         if ( ctx ) dav1d_close(&ctx);
-        if ( fp ) fclose(fp);
+        bs.close();
     }
 
     // Read the next IVF frame packet into `pending` (a fresh dav1d-owned buffer).
     bool readPacket() {
         uint8_t fh[12];
-        if ( fread(fh, 1, 12, fp) != 12 ) return false;   // EOF
+        if ( !bs.read(fh, 12) ) return false;   // EOF
         const uint32_t sz = rd32(fh);
         const int64_t ts = int64_t(rd32(fh + 4)) | (int64_t(rd32(fh + 8)) << 32);
         uint8_t * buf = dav1d_data_create(&pending, sz);
         if ( !buf ) return false;
-        if ( fread(buf, 1, sz, fp) != sz ) { dav1d_data_unref(&pending); return false; }
+        if ( !bs.read(buf, sz) ) { dav1d_data_unref(&pending); return false; }
         pending.m.timestamp = ts;
         return true;
     }
@@ -287,7 +331,7 @@ struct Av1Source final : VideoSource {
         if ( havePic ) { dav1d_picture_unref(&pic); havePic = false; }
         if ( pending.sz ) dav1d_data_unref(&pending);
         if ( ctx ) dav1d_flush(ctx);
-        if ( fp ) fseek(fp, 32, SEEK_SET);   // back to the first packet (past the 32-byte header)
+        bs.seekStart(32);   // back to the first packet (past the 32-byte header)
         eof = false; endedFlag = false;
     }
     bool hasAudio() const override { return false; }   // IVF/AV1 elementary stream carries no audio
@@ -296,18 +340,41 @@ struct Av1Source final : VideoSource {
     bool decodeAudio() override { return false; }
     bool currentAudio(AudioBatchView &) const override { return false; }
 };
+#endif // DAS_VIDEO_WITH_DAV1D
 
-// Format dispatch: peek the first 4 bytes. "DKIF" => an IVF (AV1) stream => dav1d;
-// anything else falls through to pl_mpeg.
+// Format dispatch: peek the first 4 bytes. "DKIF" => an IVF (AV1) stream => dav1d
+// (when built); anything else falls through to pl_mpeg.
 static VideoSource * createSourceFor(const char * filename) {
     FILE * f = fopen(filename, "rb");
     if ( f ) {
         char magic[4] = {0};
         const size_t n = fread(magic, 1, 4, f);
         fclose(f);
-        if ( n == 4 && memcmp(magic, "DKIF", 4) == 0 ) return Av1Source::tryOpen(filename);
+        if ( n == 4 && memcmp(magic, "DKIF", 4) == 0 ) {
+#ifdef DAS_VIDEO_WITH_DAV1D
+            return Av1Source::tryOpen(filename);
+#else
+            fprintf(stderr, "dasVideo: '%s' is an AV1 (IVF) stream, but this build has "
+                    "no AV1 support (rebuild with -DDAS_VIDEO_DAV1D=ON)\n", filename);
+            return nullptr;
+#endif
+        }
     }
     return PlmSource::tryOpen(filename);
+}
+
+// In-memory dispatch: the same magic-byte probe on a borrowed buffer (no copy).
+static VideoSource * createSourceForMemory(const uint8_t * data, size_t size) {
+    if ( data && size >= 4 && memcmp(data, "DKIF", 4) == 0 ) {
+#ifdef DAS_VIDEO_WITH_DAV1D
+        return Av1Source::tryOpenMemory(data, size);
+#else
+        fprintf(stderr, "dasVideo: in-memory AV1 (IVF) stream, but this build has no "
+                "AV1 support (rebuild with -DDAS_VIDEO_DAV1D=ON)\n");
+        return nullptr;
+#endif
+    }
+    return PlmSource::tryOpenMemory(data, size);
 }
 
 // ===== player (backend-agnostic) =====
@@ -328,6 +395,18 @@ namespace das {
 static VideoPlayer * video_open(const char * filename) {
     if ( !filename || !*filename ) return nullptr;
     VideoSource * src = createSourceFor(filename);
+    if ( !src ) return nullptr;
+    auto * p = new VideoPlayer();
+    p->src = src;
+    return p;
+}
+
+// Play from a borrowed in-memory buffer (no copy): the bytes are referenced for the
+// player's whole lifetime, so they must outlive video_close. Format is auto-detected
+// exactly as for video_open(filename). Bound as a video_open overload.
+static VideoPlayer * video_open_memory(const uint8_t * data, int32_t size) {
+    if ( !data || size <= 0 ) return nullptr;
+    VideoSource * src = createSourceForMemory(data, size_t(size));
     if ( !src ) return nullptr;
     auto * p = new VideoPlayer();
     p->src = src;
@@ -485,6 +564,9 @@ public:
             sizeof(VideoPlayer), alignof(VideoPlayer)));
         addExtern<DAS_BIND_FUN(video_open)>(*this, lib, "video_open",
             SideEffects::modifyExternal, "video_open")->args({"filename"});
+        // play from a borrowed in-memory buffer (referenced, not copied)
+        addExtern<DAS_BIND_FUN(video_open_memory)>(*this, lib, "video_open",
+            SideEffects::modifyExternal, "video_open_memory")->args({"data","size"});
         addExtern<DAS_BIND_FUN(video_close)>(*this, lib, "video_close",
             SideEffects::modifyExternal, "video_close")->args({"player"});
         addExtern<DAS_BIND_FUN(video_decode)>(*this, lib, "video_decode",

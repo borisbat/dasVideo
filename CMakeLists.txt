@@ -9,8 +9,16 @@ endif()
 
 set(DAS_VIDEO_DIR ${CMAKE_CURRENT_LIST_DIR})
 
-# dav1d (AV1) decode backend — pinned source fetched + compiled C-only, no meson.
-include(${DAS_VIDEO_DIR}/cmake/BuildDav1d.cmake)
+# Optional codecs. pl_mpeg (MPEG-1) is the always-on, zero-dependency base; each
+# additional codec is an opt-in flag that gates BOTH its build deps and its backend.
+# OFF builds a lighter, dependency-free module that embeds without fetching/compiling
+# dav1d. A future Theora/etc. backend follows the same pattern (one flag each).
+option(DAS_VIDEO_DAV1D "AV1 decode via dav1d (fetches + compiles dav1d from source)" ON)
+
+if(DAS_VIDEO_DAV1D)
+    # dav1d (AV1) backend — pinned source fetched + compiled C-only, no meson.
+    include(${DAS_VIDEO_DIR}/cmake/BuildDav1d.cmake)
+endif()
 
 # pl_mpeg (single header) is compiled into the module TU via PL_MPEG_IMPLEMENTATION.
 set(DAS_VIDEO_SRC
@@ -30,7 +38,10 @@ target_include_directories(dasModuleVideo PRIVATE
     ${DAS_VIDEO_DIR}/vendor
     ${DAS_VIDEO_DIR}/src
 )
-target_link_libraries(dasModuleVideo PRIVATE dav1d_dec)
+if(DAS_VIDEO_DAV1D)
+    target_link_libraries(dasModuleVideo PRIVATE dav1d_dec)
+    target_compile_definitions(dasModuleVideo PRIVATE DAS_VIDEO_WITH_DAV1D)
+endif()
 if(WIN32)
     if(EXISTS "${DASLANG_DIR}/lib/Release/libDaScriptDyn.lib")
         target_link_libraries(dasModuleVideo PRIVATE
