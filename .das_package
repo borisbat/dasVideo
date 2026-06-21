@@ -1,0 +1,19 @@
+options gen2
+require daslib/daspkg
+
+[export]
+def package() {
+    package_name("dasVideo")
+    package_description("Video playback for daslang (pl_mpeg / dav1d, royalty-free)")
+    package_author("borisbat")
+    package_license("MIT")
+    package_source("github.com/borisbat/dasVideo")
+    package_tag("video")
+    package_tag("media")
+    package_tag("decode")
+}
+
+[export]
+def build() {
+    cmake_build()
+}

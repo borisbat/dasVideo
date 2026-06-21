@@ -1,0 +1,29 @@
+# build dirs
+_build/
+build/
+out/
+
+# native module artifacts
+*.shared_module
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+*.so
+*.dylib
+
+# runtime / scratch
+*.log
+_smoke_*.das
+
+# docs build artifacts
+__pycache__/
+*.pyc
+_site/
+doc/build/
+
+# daspkg install dir + lockfile (created by `daspkg install`)
+modules/
+daspkg.lock

@@ -1,0 +1,12 @@
+options gen2
+require daslib/fio
+
+// dasVideo is a native C++ module. Under a DLL daslang build, load the compiled
+// .shared_module so `require video` resolves. The daslang surface (daslib/*.das)
+// gets registered here too once it lands (ROADMAP P1).
+[export]
+def initialize(project_path : string) {
+    if (das_is_dll_build()) {
+        register_dynamic_module("{project_path}/dasModuleVideo.shared_module", "Module_dasVIDEO")
+    }
+}

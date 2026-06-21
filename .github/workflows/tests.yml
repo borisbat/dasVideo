@@ -1,0 +1,107 @@
+name: tests
+
+# Build dasVideo's native module and run the headless smoke (loads the
+# .shared_module, calls video_backend_ready). No GPU / display / audio needed at
+# P0. Standard runners only (free on public repos) — the heavy daslang build is
+# minimised by disabling modules the dasVideo module doesn't link.
+#
+# Linux + macOS only for now, mirroring dasVulkan. Windows CI is a fast-follow
+# (the module build is already proven locally; the daslang Windows build needs
+# MSVC env + bison/flex wiring). See ROADMAP.md.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-14
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: "Checkout daslang"
+        uses: actions/checkout@v4
+        with:
+          repository: GaijinEntertainment/daScript
+          path: daslang-src
+          ref: master
+
+      - name: "Checkout dasVideo"
+        uses: actions/checkout@v4
+        with:
+          path: dasVideo
+
+      - name: "Install modern bison (macOS)"
+        # macOS ships GNU bison 2.3, too old for daslang's parser grammar. Linux
+        # runners have a new-enough bison + flex preinstalled.
+        if: runner.os == 'macOS'
+        run: |
+          set -eux
+          brew install bison
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: "Install CMake and Ninja"
+        uses: lukka/get-cmake@latest
+
+      - name: "Set up sccache"
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: "Build daslang (minimal — module links the runtime only)"
+        working-directory: daslang-src
+        # Only the daslang binary + its shared runtime libs are needed. The dasVideo
+        # module links lib/liblibDaScriptDyn{,_runtime}.* and needs no HV/PUGIXML/
+        # LLVM/GLFW, so disable them to keep the build small + fast.
+        run: |
+          set -eux
+          cmake --no-warn-unused-cli -B ./build \
+            -DCMAKE_BUILD_TYPE:STRING=Release \
+            -DDAS_HV_DISABLED=ON \
+            -DDAS_PUGIXML_DISABLED=ON \
+            -DDAS_LLVM_DISABLED=ON \
+            -DDAS_GLFW_DISABLED=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -G Ninja
+          cmake --build ./build --parallel --target daslang
+          sccache --show-stats
+
+      - name: "Build the dasVideo native module"
+        # Build the .shared_module directly (NOT via daspkg install). Output lands at
+        # <repo>/dasModuleVideo.shared_module (CMakeLists output dir) and is picked
+        # up by -load_module via the .das_module descriptor.
+        run: |
+          set -eux
+          cmake -S "${GITHUB_WORKSPACE}/dasVideo" -B "${GITHUB_WORKSPACE}/dasVideo/_build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDASLANG_DIR="${GITHUB_WORKSPACE}/daslang-src" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake --build "${GITHUB_WORKSPACE}/dasVideo/_build" --config Release --parallel 2
+          sccache --show-stats
+          ls -la "${GITHUB_WORKSPACE}/dasVideo"/*.shared_module
+
+      - name: "Headless smoke (module loads + backend ready)"
+        working-directory: ${{ github.workspace }}/dasVideo
+        run: |
+          set -eux
+          "${GITHUB_WORKSPACE}/daslang-src/bin/daslang" \
+            -load_module "${GITHUB_WORKSPACE}/dasVideo" \
+            "${GITHUB_WORKSPACE}/dasVideo/tests/test_video.das"
