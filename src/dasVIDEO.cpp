@@ -12,6 +12,7 @@
 #include "pl_mpeg.h"
 
 #include <vector>
+#include <cstring>
 
 namespace das {
 
@@ -72,6 +73,14 @@ static bool video_decode(VideoPlayer * p) {
     return true;
 }
 
+// Rewind to the start (for looping playback).
+static void video_rewind(VideoPlayer * p) {
+    if ( !p || !p->plm ) return;
+    plm_rewind(p->plm);
+    p->ended = false;
+    p->frame = nullptr;
+}
+
 // ===== borrowed pixel access (player owns, consumer borrows) =====
 
 // Easy route: convert the current frame to packed RGBA8 into the player-owned
@@ -82,6 +91,9 @@ static void video_get_data_rgba(VideoPlayer * p,
     if ( !p || !p->frame ) return;
     const size_t need = size_t(p->frame->width) * p->frame->height * 4;
     if ( p->rgba.size() != need ) p->rgba.resize(need);
+    // plm_frame_to_rgba writes R/G/B but not the alpha byte; pre-fill 0xFF so the
+    // frame is opaque (the convert overwrites only RGB).
+    memset(p->rgba.data(), 0xFF, p->rgba.size());
     plm_frame_to_rgba(p->frame, p->rgba.data(), int(p->frame->width) * 4);
     Array arr;
     array_mark_locked(arr, p->rgba.data(), uint64_t(p->rgba.size()));
@@ -128,6 +140,8 @@ public:
             SideEffects::modifyExternal, "video_close")->args({"player"});
         addExtern<DAS_BIND_FUN(video_decode)>(*this, lib, "video_decode",
             SideEffects::modifyExternal, "video_decode")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_rewind)>(*this, lib, "video_rewind",
+            SideEffects::modifyExternal, "video_rewind")->args({"player"});
         addExtern<DAS_BIND_FUN(video_width)>(*this, lib, "video_width",
             SideEffects::none, "video_width")->args({"player"});
         addExtern<DAS_BIND_FUN(video_height)>(*this, lib, "video_height",
