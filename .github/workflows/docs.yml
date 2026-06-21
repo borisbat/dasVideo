@@ -37,8 +37,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: "Install Sphinx"
-        run: pip install sphinx alabaster
+      - name: "Install Sphinx + theme"
+        # Pinned to match the daslang docs (sphinx_rtd_theme + the Forge dark CSS).
+        run: pip install sphinx==7.2.6 sphinx-rtd-theme==2.0.0
 
       - name: "Build Sphinx HTML"
         # -W: warnings are errors (the das lexer / broken refs fail the build).
