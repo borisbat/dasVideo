@@ -14,9 +14,23 @@ Lifecycle
 
     video_open(filename : string) : VideoPlayer?
 
-Open an MPEG-1 ``.mpg`` file. Returns a player handle, or ``null`` if the file can't be
-opened or has no decodable stream. Audio is **disabled** until you call
-``video_enable_audio`` — the video-only paths carry no audio cost.
+Open a video file — an MPEG-1 ``.mpg``, or an AV1 ``.ivf`` when the module is built
+with dav1d (the default; ``DAS_VIDEO_DAV1D``). The container format is auto-detected.
+Returns a player handle, or ``null`` if the file can't be opened or has no decodable
+stream. Audio is **disabled** until you call ``video_enable_audio`` — the video-only
+paths carry no audio cost.
+
+.. code-block:: das
+
+    video_open(data : uint8 const?; size : int) : VideoPlayer?
+
+Open from a **borrowed in-memory buffer** instead of a file, with the same format
+auto-detection. The bytes are **referenced, not copied** — they must stay alive and
+unchanged until ``video_close`` (the player reads from them throughout playback). This
+is the path for embedded or preloaded clips you render-to-texture and replay, or to
+open several players over one buffer. From a ``das`` array, pass the address
+explicitly: ``video_open(unsafe(addr(buf[0])), length(buf))`` — the ``unsafe`` marks
+the buffer-lifetime contract you're accepting.
 
 .. code-block:: das
 
