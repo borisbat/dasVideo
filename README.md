@@ -5,8 +5,9 @@ Video playback for [daslang](https://dascript.org/) — decode a video file to f
 thin daslang surface, modeled on [dasVulkan](https://github.com/borisbat/dasVulkan)
 / dasImgui.
 
-> **Status: early.** P0 scaffold — the module builds and loads on Windows / Linux /
-> macOS; decode lands in P1. See [ROADMAP.md](ROADMAP.md).
+> **Status: playable.** MPEG-1 video + MP2 audio decode, OpenGL output (RGBA and
+> YUV-shader routes), and A/V-synced playback with sound all work on Windows / Linux /
+> macOS. Next: a dasImgui embed, then the dav1d (AV1) backend. See [ROADMAP.md](ROADMAP.md).
 
 ## Design
 
@@ -55,6 +56,18 @@ daslang -load_module <repo> tests/test_video.das
 The daslang binary must be a DLL build (`das_is_dll_build()` true) — the `.das_module`
 only loads the native module under that flag. As a daspkg package, consumers just
 `daspkg install github.com/borisbat/dasVideo` (registered once it decodes — ROADMAP P6).
+
+## Examples
+
+Windowed players (need a display; the audio one also needs an audio device — so they
+run by hand, not in CI). They loop by default and take a `clargs` CLI (`--video`,
+`--scale`, `--max-frames`, `--shot out.png`, `--noloop`, `--help`):
+
+```
+daslang -load_module <repo> examples/play_rgba_gl.das    # RGBA → one texture
+daslang -load_module <repo> examples/play_yuv_gl.das     # native YUV planes → GPU YUV→RGB
+daslang -load_module <repo> examples/play_audio_gl.das   # video + sound, A/V synced (--mute to pace by wall-clock)
+```
 
 ## License
 

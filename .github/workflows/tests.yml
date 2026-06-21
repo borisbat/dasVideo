@@ -1,9 +1,10 @@
 name: tests
 
-# Build dasVideo's native module and run the headless smoke (loads the
-# .shared_module, calls video_backend_ready). No GPU / display / audio needed at
-# P0. Standard runners only (free on public repos) — the heavy daslang build is
-# minimised by disabling modules the dasVideo module doesn't link.
+# Build dasVideo's native module and run the headless smokes: video decode
+# (test_video.das) + audio decode (test_audio.das). Both are device-free — they
+# exercise decode + the get_data / get_audio_data borrow paths, no GPU / display /
+# audio hardware needed. Standard runners only (free on public repos) — the heavy
+# daslang build is minimised by disabling modules the dasVideo module doesn't link.
 #
 # Linux + macOS only for now, mirroring dasVulkan. Windows CI is a fast-follow
 # (the module build is already proven locally; the daslang Windows build needs
@@ -98,10 +99,18 @@ jobs:
           sccache --show-stats
           ls -la "${GITHUB_WORKSPACE}/dasVideo"/*.shared_module
 
-      - name: "Headless smoke (module loads + backend ready)"
+      - name: "Headless smoke (video decode + get_data routes)"
         working-directory: ${{ github.workspace }}/dasVideo
         run: |
           set -eux
           "${GITHUB_WORKSPACE}/daslang-src/bin/daslang" \
             -load_module "${GITHUB_WORKSPACE}/dasVideo" \
             "${GITHUB_WORKSPACE}/dasVideo/tests/test_video.das"
+
+      - name: "Headless smoke (audio decode + get_audio_data borrow)"
+        working-directory: ${{ github.workspace }}/dasVideo
+        run: |
+          set -eux
+          "${GITHUB_WORKSPACE}/daslang-src/bin/daslang" \
+            -load_module "${GITHUB_WORKSPACE}/dasVideo" \
+            "${GITHUB_WORKSPACE}/dasVideo/tests/test_audio.das"

@@ -1,10 +1,12 @@
-// dasVideo native module — P1: pl_mpeg video decode.
+// dasVideo native module — pl_mpeg video + audio decode.
 //
-// Opens an MPEG-1 (.mpg) stream and decodes video frames. pl_mpeg (MIT) is
-// compiled into this TU. The player owns the decoder + a reused RGBA convert
-// buffer; the consumer borrows per-frame pixels through `get_data` block
-// accessors (RAII temp views, valid only inside the block) — the "player owns,
-// consumer borrows" model from ORIGINAL_PLAN.md. Audio + A/V sync are P3.
+// Opens an MPEG-1 (.mpg) stream and decodes video frames + MP2 audio. pl_mpeg
+// (MIT) is compiled into this TU. The player owns the decoder + a reused RGBA
+// convert buffer; the consumer borrows per-frame pixels and per-batch audio
+// through `get_data` / `get_audio_data` block accessors (RAII temp views, valid
+// only inside the block) — the "player owns, consumer borrows" model from
+// ORIGINAL_PLAN.md. Audio is opt-in (video_enable_audio) so the video-only paths
+// stay zero-overhead; A/V sync is driven in das (audio is the master clock).
 #include "daScript/daScript.h"
 #include "daScript/ast/ast_handle.h"
 
@@ -19,6 +21,7 @@ namespace das {
 struct VideoPlayer {
     plm_t * plm = nullptr;
     plm_frame_t * frame = nullptr;      // last decoded frame; borrowed from plm, valid until next decode
+    plm_samples_t * samples = nullptr;  // last decoded audio batch; borrowed from plm, valid until next plm_decode_audio
     std::vector<uint8_t> rgba;          // player-owned RGBA convert target, reused per frame
     bool ended = false;
 };
@@ -79,6 +82,51 @@ static void video_rewind(VideoPlayer * p) {
     plm_rewind(p->plm);
     p->ended = false;
     p->frame = nullptr;
+    p->samples = nullptr;
+}
+
+// ===== audio (opt-in) =====
+
+static bool video_has_audio(VideoPlayer * p) {
+    return (p && p->plm) ? plm_get_num_audio_streams(p->plm) > 0 : false;
+}
+
+// Enable the (first) audio stream. video_open leaves audio disabled so the
+// video-only paths never buffer audio packets; call this right after open if you
+// want sound. Returns true only if the file actually has an audio stream.
+static bool video_enable_audio(VideoPlayer * p) {
+    if ( !p || !p->plm || plm_get_num_audio_streams(p->plm) <= 0 ) return false;
+    plm_set_audio_stream(p->plm, 0);
+    plm_set_audio_enabled(p->plm, 1);
+    return true;
+}
+
+// pl_mpeg always decodes to interleaved stereo.
+static int32_t video_audio_channels(VideoPlayer *) { return 2; }
+
+// Decode the next audio batch (PLM_AUDIO_SAMPLES_PER_FRAME=1152 stereo frames).
+// Returns true if a batch was produced; held by the player until the next call.
+static bool video_decode_audio(VideoPlayer * p) {
+    if ( !p || !p->plm ) return false;
+    p->samples = plm_decode_audio(p->plm);
+    return p->samples != nullptr;
+}
+
+static double  video_audio_time(VideoPlayer * p)  { return (p && p->samples) ? p->samples->time : 0.0; }
+static int32_t video_audio_count(VideoPlayer * p) { return (p && p->samples) ? int32_t(p->samples->count) : 0; } // stereo frames
+
+// Borrowed audio access: hand the decoded interleaved stereo floats (count*2)
+// to the block, valid only inside it. append_to_pcm takes ownership, so clone
+// the borrowed samples into a real array before pushing them.
+static void video_get_audio_data(VideoPlayer * p,
+        const TBlock<void, TTemporary<TArray<float> const>> & block,
+        Context * context, LineInfoArg * at) {
+    if ( !p || !p->samples ) return;
+    Array arr;
+    array_mark_locked(arr, (void *)p->samples->interleaved, uint64_t(p->samples->count) * 2);
+    vec4f args[1];
+    args[0] = cast<Array *>::from(&arr);
+    context->invoke(block, args, nullptr, at);
 }
 
 // ===== borrowed pixel access (player owns, consumer borrows) =====
@@ -167,6 +215,21 @@ public:
             SideEffects::modifyExternal, "video_get_data_rgba")->args({"player","block","context","line"});
         addExtern<DAS_BIND_FUN(video_get_data_yuv)>(*this, lib, "get_data",
             SideEffects::modifyExternal, "video_get_data_yuv")->args({"player","block","context","line"});
+        // audio (opt-in)
+        addExtern<DAS_BIND_FUN(video_has_audio)>(*this, lib, "video_has_audio",
+            SideEffects::none, "video_has_audio")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_enable_audio)>(*this, lib, "video_enable_audio",
+            SideEffects::modifyExternal, "video_enable_audio")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_audio_channels)>(*this, lib, "video_audio_channels",
+            SideEffects::none, "video_audio_channels")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_decode_audio)>(*this, lib, "video_decode_audio",
+            SideEffects::modifyExternal, "video_decode_audio")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_audio_time)>(*this, lib, "video_audio_time",
+            SideEffects::none, "video_audio_time")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_audio_count)>(*this, lib, "video_audio_count",
+            SideEffects::none, "video_audio_count")->args({"player"});
+        addExtern<DAS_BIND_FUN(video_get_audio_data)>(*this, lib, "get_audio_data",
+            SideEffects::modifyExternal, "video_get_audio_data")->args({"player","block","context","line"});
         addExtern<DAS_BIND_FUN(video_backend_ready)>(*this, lib, "video_backend_ready",
             SideEffects::none, "video_backend_ready");
         verifyAotReady();
