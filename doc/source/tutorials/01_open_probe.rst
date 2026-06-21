@@ -38,10 +38,13 @@ with a 44100 Hz tone) and checks the reported info against its known shape.
 Running it
 ----------
 
+Run it from the **repo root** — the test opens its sample with a repo-root-relative
+path, matching the convention the other tests use:
+
 .. code-block:: bash
 
-   daslang -load_module <dasVideo> \
-       <dasVideo>/tutorials/01_open_probe/test_open_probe.das
+   cd <dasVideo>
+   daslang -load_module . tutorials/01_open_probe/test_open_probe.das
 
 prints::
 
@@ -50,5 +53,5 @@ prints::
 Next
 ----
 
-The next tutorial starts decoding: the frame loop, the **borrow** model
+:doc:`02_decode_rgba` starts decoding: the frame loop, the **borrow** model
 (``get_data`` hands you the pixels without copying), and ``video_rewind`` to loop.
