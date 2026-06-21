@@ -134,26 +134,6 @@ def upload_frame(player : VideoPlayer?; vw, vh : int) {
     }
 }
 
-// Top up the PCM stream from the decoded audio. Returns true when the audio
-// stream reaches its end (so the caller stops feeding until the next loop).
-def feed_audio(player : VideoPlayer?; sid : uint64; status_box : LockBox?) : bool {
-    var que = 0
-    status_box |> get() $(st : AudioChannelStatus#) {
-        que = st.stream_que_length
-    }
-    while (que < AUDIO_TARGET_CHUNKS) {
-        if (!video_decode_audio(player)) return true
-        var chunk : array<float>
-        // append_to_pcm takes ownership, so clone the borrowed batch first.
-        player |> get_audio_data() $(s : array<float>#) {
-            chunk := s
-        }
-        append_to_pcm(sid, chunk)
-        que++
-    }
-    return false
-}
-
 def read_consumed(status_box : LockBox?) : uint64 {
     var consumed = 0ul
     status_box |> get() $(st : AudioChannelStatus#) {
@@ -178,55 +158,72 @@ def run_loop(player : VideoPlayer?; window : GLFWwindow?; cfg : PlayArgs; vw, vh
     // at this absolute clock value (audio consumed-seconds, or wall-clock when muted).
     var loop_offset = muted ? glfwGetTime() : 0.0lf
     var shown_pts = -frame_dur        // pts of the last decoded+shown frame (-dur => frame 0 is due now)
-    var audio_done = false
-    var draining = false              // letting the audio queue empty before a clean loop restart
+    var total_fed = 0ul               // cumulative audio sample-frames pushed (audio path)
+    var ended = false                 // stream hit end and we are NOT looping
     var shot_saved = false
     var frame = 0
     var displayed = 0
     while (glfwWindowShouldClose(window) == 0) {
         glfwPollEvents()
-        if (!muted && !draining && !audio_done) {
-            if (feed_audio(player, sid, status_box)) {
-                audio_done = true
+        // Keep the PCM channel fed: a dasAudio PCM stream dies on underrun, so the
+        // queue must never empty. When the audio stream ends we rewind and feed from the
+        // top right away; the loop's audio plays after everything fed so far, so anchoring
+        // the video at `total_fed` keeps picture and sound in sync across the boundary.
+        if (!muted && !ended) {
+            var que = read_que(status_box)
+            while (que < AUDIO_TARGET_CHUNKS) {
+                if (!video_decode_audio(player)) {
+                    if (cfg.noloop) {
+                        ended = true
+                    } else {
+                        video_rewind(player)
+                        loop_offset = double(total_fed) / rate
+                        shown_pts = -frame_dur
+                    }
+                    break
+                }
+                let count = video_audio_count(player)
+                var chunk : array<float>
+                // append_to_pcm takes ownership, so clone the borrowed batch first.
+                player |> get_audio_data() $(s : array<float>#) {
+                    chunk := s
+                }
+                append_to_pcm(sid, chunk)
+                total_fed += uint64(count)
+                que++
             }
         }
         let media_time = (muted ? (glfwGetTime() - loop_offset)
                                 : (double(read_consumed(status_box)) / rate - loop_offset))
-        if (!draining) {
-            // advance to the latest frame that is due; drop intermediates, upload only the last
-            var decoded_any = false
-            var hit_end = false
-            while (media_time >= shown_pts + frame_dur) {
-                if (video_decode(player)) {
-                    shown_pts = video_frame_time(player)
-                    decoded_any = true
-                } else {
-                    hit_end = true
-                    break
-                }
+        // advance to the latest frame that is due; drop intermediates, upload only the last
+        var decoded_any = false
+        var hit_end = false
+        while (media_time >= shown_pts + frame_dur) {
+            if (video_decode(player)) {
+                shown_pts = video_frame_time(player)
+                decoded_any = true
+            } else {
+                hit_end = true
+                break
             }
-            if (decoded_any) {
-                upload_frame(player, vw, vh)
-                displayed++
-            }
-            if (hit_end) {
-                break if (cfg.noloop)
-                if (muted) {
-                    video_rewind(player)
-                    loop_offset = glfwGetTime()
-                    shown_pts = -frame_dur
-                } else {
-                    draining = true       // finish the queued audio, then restart in sync
-                }
-            }
-        } elif (read_que(status_box) <= 0) {
-            // queue drained — restart both streams cleanly, re-anchoring the clock to now
-            loop_offset = double(read_consumed(status_box)) / rate
-            video_rewind(player)
-            shown_pts = -frame_dur
-            audio_done = false
-            draining = false
         }
+        if (decoded_any) {
+            upload_frame(player, vw, vh)
+            displayed++
+        }
+        // Muted path loops off wall-clock (no audio channel to keep alive); the audio
+        // path loops via the audio-end rewind above and just holds the last frame until then.
+        if (hit_end && muted) {
+            if (cfg.noloop) {
+                ended = true
+            } else {
+                video_rewind(player)
+                loop_offset = glfwGetTime()
+                shown_pts = -frame_dur
+            }
+        }
+        // noloop: exit once the stream ended and (audio path) its audio finished playing.
+        break if (ended && (muted || double(read_consumed(status_box)) >= double(total_fed)))
         var dw, dh : int
         glfwGetFramebufferSize(window, dw, dh)
         glViewport(0, 0, dw, dh)
