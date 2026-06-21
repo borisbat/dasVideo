@@ -53,6 +53,14 @@ Registered in the daspkg index only once it actually decodes (ROADMAP P6). Consu
 pull via daspkg — `build()` → `cmake_build()` sets `DASLANG_DIR`. Local dev points
 `DASLANG_DIR` at a checkout/worktree.
 
+## Emma — the presenter
+
+dasVideo's demo/tutorial clips are fronted by **Emma**, a fixed synthetic face + voice we
+drive with any script (Kokoro TTS → Sonic talking-head → mp4). The locked, reproducible
+recipe — face, voice, the "dahss" pronunciation fix, Sonic config, the GPU-box setup, and
+the hard-won gotchas — is in **`EMMA.md`**. Read it before generating any Emma clip; the
+canonical (irreproducible GAN) source faces live in `assets/emma/`.
+
 ## Workflow
 
 The genesis scaffold went to master; further work via PRs. Lint is mandatory.
