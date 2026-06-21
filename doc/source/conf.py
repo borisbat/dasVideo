@@ -1,11 +1,17 @@
-# Minimal Sphinx config — P0 skeleton. The full reference build (custom daslang
-# domain + generated stdlib pages, modeled on dasVulkan) arrives in ROADMAP P6.
+# Sphinx config for the dasVideo reference docs. The local `daslang` extension
+# (copied from the daslang docs, same as dasImgui) registers the `das` Pygments
+# lexer + the `das` domain so `.. code-block:: das` highlights correctly.
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+
 project = "dasVideo"
 author = "Boris Batkin"
 copyright = "2026, Boris Batkin"
 release = "0.1"
 
-extensions = []
+extensions = ["daslang"]
 templates_path = ["_templates"]
 exclude_patterns = []
 
