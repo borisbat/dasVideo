@@ -35,24 +35,35 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
       loop-by-default (`--noloop`/`--max-frames`/`--scale`/`--shot`). Visually verified
       (test pattern renders in a window). Surfaced + fixed an opaque-alpha bug in the
       RGBA converter along the way.
-- [ ] `examples/play_yuv_gl` — 3×`GL_R8` textures + YUV→RGB fragment shader
+- [x] `examples/play_yuv_gl` — 3×`GL_R8` textures + YUV→RGB fragment shader (BT.601,
+      matches pl_mpeg). Per-plane `GL_UNPACK_ROW_LENGTH` for the macroblock-rounded
+      strides; `@stage = 0/1/2` to bind the 3 samplers to distinct units. Visually
+      verified against the RGBA path.
 
 ### Follow-ups
 
-- [ ] **daslang teardown crash** (not dasVideo): clargs early-exit (e.g. `--help`) +
-      the full multi-module GL example stack → `g_envTotal=1 at exit (Initialize/Shutdown
-      not balanced)`. Normal playback exits clean. Isolated — clargs / glfw / stbimage /
-      dasVideo are each individually fine; only the combined stack trips it. A daslang
-      module Init/Shutdown accounting bug to chase upstream.
+- [x] **daslang teardown crash** (was: clargs early-exit like `--help` + the GL stack →
+      `g_envTotal=1`). Root cause: `defer`-lowered `finally` ran on the early `return`
+      and read a finally-referenced local whose stack slot the interpreter's reuse
+      optimization had handed to an earlier sub-scope, clobbering its zero → garbage
+      pointer → AV. Fixed upstream in daslang (disable slot reuse for blocks with a
+      `finalList`) + regression test. No dasVideo change was needed.
 
 ## P3 — Audio + sync
 
-- [ ] decode MP2 → interleaved float PCM
-- [ ] `play_sound_from_pcm_stream` + `append_to_pcm` top-up loop
-- [ ] `consumed_position` master clock; `stream_que_length` backpressure
-- [ ] `update()` loop: top-up / promote-when-due / drop-or-hold; double-buffered video
-- [ ] silent / no-audio wall-clock fallback
-- [ ] test with an audio-bearing clip
+- [x] decode MP2 → interleaved float PCM (`video_decode_audio` + `get_audio_data`
+      borrow; audio is opt-in via `video_enable_audio` so video-only paths stay
+      zero-overhead)
+- [x] `play_sound_from_pcm_stream` + `append_to_pcm` top-up loop (`feed_audio`,
+      `AUDIO_TARGET_CHUNKS` slack)
+- [x] `consumed_position` master clock; `stream_que_length` backpressure
+- [x] pace loop: top-up / promote-when-due / drop-intermediate; clean looping via
+      drain-then-restart (re-anchor the clock so A/V stays in sync across the boundary)
+- [x] silent / no-audio wall-clock fallback (`--mute` + auto when no audio stream)
+- [x] `examples/play_audio_gl` — windowed A/V-synced player (real playback verified:
+      `consumed_position` advances, video frames pace to it)
+- [x] test with an audio-bearing clip (`tests/test_audio.das` + `test_audio.mpg`
+      fixture; device-free decode+borrow, wired into CI)
 
 ## P4 — dasImgui
 
