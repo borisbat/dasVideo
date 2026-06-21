@@ -65,20 +65,34 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 - [x] test with an audio-bearing clip (`tests/test_audio.das` + `test_audio.mpg`
       fixture; device-free decode+borrow, wired into CI)
 
-## P4 — dasImgui
+### Demo presenter — Emma
+
+- [x] **Emma** — synthetic face + voice (Kokoro `bf_emma` → Sonic talking-head). The full
+      reproducible recipe is in `EMMA.md`; canonical source faces in `assets/emma/`.
+      `assets/emma/emma_intro.mpg` (1024 master → 384×384 MPEG-1/MP2) is `play_audio_gl`'s
+      default, so the audio demo is "Emma introduces dasVideo" with real A/V sync.
+
+## Plan order (per Boris): docs/tutorials → daspkg → AV1 after. (P4 imgui later.)
+
+## P6 — Docs + tutorials  ← NEXT
+
+- [ ] Sphinx reference content (per-API) for the current surface (open/decode/get_data/
+      get_audio_data/the audio-sync model)
+- [ ] tutorial ladder: open-probe → rgba-to-gl → yuv-shader → audio-sync → (imgui-embed) → (av1)
+- [ ] recordings (voiced, self-verifying) per the standard pipeline — Emma fronts them
+
+## daspkg — register (unblocked: it's demoable now)
+
+- [ ] daspkg-index entry; `build()` → `cmake_build()` sets `DASLANG_DIR`
+
+## P4 — dasImgui (later)
 
 - [ ] `image()` embed in an imgui window — flagship demo
 
-## P5 — dav1d backend
+## P5 — dav1d backend (the AV1 follow-up, after docs/daspkg)
 
 - [ ] vendor dav1d; WebM demux; Opus/Vorbis audio decode
 - [ ] behind the same `VideoSource` API; backend selection by probe/extension
-
-## P6 — Docs + tutorials
-
-- [ ] Sphinx reference content (per-API)
-- [ ] tutorial ladder: open-probe → rgba-to-gl → yuv-shader → audio-sync → imgui-embed → (av1)
-- [ ] recordings (voiced, self-verifying) per the standard pipeline
 
 ## Cross-cutting
 
