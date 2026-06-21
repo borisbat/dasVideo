@@ -114,3 +114,15 @@ jobs:
           "${GITHUB_WORKSPACE}/daslang-src/bin/daslang" \
             -load_module "${GITHUB_WORKSPACE}/dasVideo" \
             "${GITHUB_WORKSPACE}/dasVideo/tests/test_audio.das"
+
+      - name: "Tutorial gates (every tutorials/*/test_*.das)"
+        # Each tutorial ships a headless self-verifying test. Run from the repo
+        # root so the tutorials' relative fixture paths resolve. The loop scales
+        # as tutorials are added — no per-tutorial CI edit.
+        working-directory: ${{ github.workspace }}/dasVideo
+        run: |
+          set -eux
+          for t in tutorials/*/test_*.das; do
+            "${GITHUB_WORKSPACE}/daslang-src/bin/daslang" \
+              -load_module "${GITHUB_WORKSPACE}/dasVideo" "$t"
+          done
