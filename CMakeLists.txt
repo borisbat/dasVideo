@@ -9,6 +9,9 @@ endif()
 
 set(DAS_VIDEO_DIR ${CMAKE_CURRENT_LIST_DIR})
 
+# dav1d (AV1) decode backend — pinned source fetched + compiled C-only, no meson.
+include(${DAS_VIDEO_DIR}/cmake/BuildDav1d.cmake)
+
 # pl_mpeg (single header) is compiled into the module TU via PL_MPEG_IMPLEMENTATION.
 set(DAS_VIDEO_SRC
     ${DAS_VIDEO_DIR}/src/dasVIDEO.cpp
@@ -27,6 +30,7 @@ target_include_directories(dasModuleVideo PRIVATE
     ${DAS_VIDEO_DIR}/vendor
     ${DAS_VIDEO_DIR}/src
 )
+target_link_libraries(dasModuleVideo PRIVATE dav1d_dec)
 if(WIN32)
     if(EXISTS "${DASLANG_DIR}/lib/Release/libDaScriptDyn.lib")
         target_link_libraries(dasModuleVideo PRIVATE

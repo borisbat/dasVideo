@@ -23,6 +23,10 @@
 
 #include <vector>
 #include <cstring>
+#include <cstdio>
+#include <cerrno>
+
+#include <dav1d/dav1d.h>
 
 namespace das {
 
@@ -144,9 +148,165 @@ struct PlmSource final : VideoSource {
     }
 };
 
-// Format dispatch. P5+ probes magic bytes here (AV1/WebM) and returns the matching
-// backend; for now pl_mpeg is the only one.
+// ===== dav1d (AV1) backend =====
+
+// Decodes an AV1 elementary stream in an IVF container (the trivial AV1 container:
+// a 32-byte file header + per-frame [size, timestamp, OBUs]). Video only — WebM +
+// Opus audio is the next phase. Tier-1 per ORIGINAL_PLAN: 8-bit 4:2:0 only;
+// 10-bit / HDR / 4:2:2 / 4:4:4 fail closed with a clear message.
+struct Av1Source final : VideoSource {
+    FILE * fp = nullptr;
+    Dav1dContext * ctx = nullptr;
+    Dav1dData pending{};        // current packet being fed; .sz == 0 when empty
+    Dav1dPicture pic{};
+    bool havePic = false;
+    bool eof = false;
+    bool endedFlag = false;
+    bool unsupported = false;   // set once if the stream isn't 8-bit 4:2:0
+    int w = 0, h = 0;
+    uint32_t tbNum = 0, tbDen = 0, nFrames = 0;   // IVF timebase + header frame count
+
+    static uint32_t rd32(const uint8_t * b) {
+        return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
+    }
+
+    // null (not consumed) if not an AV1 IVF, so video_open falls through to pl_mpeg.
+    static Av1Source * tryOpen(const char * filename) {
+        FILE * fp = fopen(filename, "rb");
+        if ( !fp ) return nullptr;
+        uint8_t hdr[32];
+        if ( fread(hdr, 1, 32, fp) != 32 ||
+             memcmp(hdr, "DKIF", 4) != 0 || memcmp(hdr + 8, "AV01", 4) != 0 ) {
+            fclose(fp);
+            return nullptr;
+        }
+        Dav1dSettings settings;
+        dav1d_default_settings(&settings);
+        Dav1dContext * ctx = nullptr;
+        if ( dav1d_open(&ctx, &settings) != 0 ) { fclose(fp); return nullptr; }
+        auto * s = new Av1Source();
+        s->fp = fp;
+        s->ctx = ctx;
+        s->w = int(hdr[12] | (hdr[13] << 8));
+        s->h = int(hdr[14] | (hdr[15] << 8));
+        s->tbNum = rd32(hdr + 16);
+        s->tbDen = rd32(hdr + 20);
+        s->nFrames = rd32(hdr + 24);
+        return s;
+    }
+    ~Av1Source() override {
+        if ( havePic ) dav1d_picture_unref(&pic);
+        if ( pending.sz ) dav1d_data_unref(&pending);
+        if ( ctx ) dav1d_close(&ctx);
+        if ( fp ) fclose(fp);
+    }
+
+    // Read the next IVF frame packet into `pending` (a fresh dav1d-owned buffer).
+    bool readPacket() {
+        uint8_t fh[12];
+        if ( fread(fh, 1, 12, fp) != 12 ) return false;   // EOF
+        const uint32_t sz = rd32(fh);
+        const int64_t ts = int64_t(rd32(fh + 4)) | (int64_t(rd32(fh + 8)) << 32);
+        uint8_t * buf = dav1d_data_create(&pending, sz);
+        if ( !buf ) return false;
+        if ( fread(buf, 1, sz, fp) != sz ) { dav1d_data_unref(&pending); return false; }
+        pending.m.timestamp = ts;
+        return true;
+    }
+
+    int    width() const override      { return w; }
+    int    height() const override     { return h; }
+    double framerate() const override  { return tbDen ? double(tbNum) / double(tbDen) : 0.0; }
+    int    samplerate() const override { return 0; }
+    double duration() const override   { return tbNum ? double(nFrames) * double(tbDen) / double(tbNum) : 0.0; }
+    bool   ended() const override      { return endedFlag; }
+
+    bool decodeVideo() override {
+        if ( unsupported || !ctx ) return false;
+        if ( havePic ) { dav1d_picture_unref(&pic); havePic = false; }
+        for ( ;; ) {
+            if ( pending.sz == 0 && !eof ) {
+                if ( !readPacket() ) eof = true;
+            }
+            if ( pending.sz > 0 ) {
+                const int r = dav1d_send_data(ctx, &pending);
+                if ( r < 0 && r != DAV1D_ERR(EAGAIN) ) { endedFlag = true; return false; }
+            }
+            const int rp = dav1d_get_picture(ctx, &pic);
+            if ( rp == 0 ) {
+                if ( pic.p.layout != DAV1D_PIXEL_LAYOUT_I420 || pic.p.bpc != 8 ) {
+                    fprintf(stderr, "dasVideo: AV1 stream is %d-bit, pixel layout %d; "
+                            "only 8-bit 4:2:0 is supported\n", pic.p.bpc, int(pic.p.layout));
+                    dav1d_picture_unref(&pic);
+                    unsupported = true; endedFlag = true;
+                    return false;
+                }
+                havePic = true;
+                return true;
+            }
+            if ( rp == DAV1D_ERR(EAGAIN) ) {
+                if ( pending.sz == 0 && eof ) { endedFlag = true; return false; }   // fully drained
+                continue;
+            }
+            endedFlag = true;   // hard decode error
+            return false;
+        }
+    }
+    bool currentFrame(VideoFrameView & v) const override {
+        if ( !havePic ) return false;
+        v.y  = (const uint8_t *)pic.data[0]; v.yW = int(pic.stride[0]); v.yH = pic.p.h;
+        v.cb = (const uint8_t *)pic.data[1]; v.cr = (const uint8_t *)pic.data[2];
+        v.cW = int(pic.stride[1]); v.cH = (pic.p.h + 1) / 2;
+        v.pts = tbNum ? double(pic.m.timestamp) * double(tbDen) / double(tbNum) : 0.0;
+        return true;
+    }
+    // BT.601 limited-range YUV420 -> RGB (alpha left as the caller's pre-filled 0xFF).
+    void convertRgba(uint8_t * dst, int dstStride) const override {
+        if ( !havePic ) return;
+        const uint8_t * yp = (const uint8_t *)pic.data[0];
+        const uint8_t * up = (const uint8_t *)pic.data[1];
+        const uint8_t * vp = (const uint8_t *)pic.data[2];
+        const int ys = int(pic.stride[0]), cs = int(pic.stride[1]);
+        auto cl = [](int x) { return uint8_t(x < 0 ? 0 : (x > 255 ? 255 : x)); };
+        for ( int j = 0; j < h; ++j ) {
+            uint8_t * row = dst + j * dstStride;
+            const uint8_t * yr = yp + j * ys;
+            const uint8_t * ur = up + (j >> 1) * cs;
+            const uint8_t * vr = vp + (j >> 1) * cs;
+            for ( int i = 0; i < w; ++i ) {
+                const int C = int(yr[i]) - 16;
+                const int D = int(ur[i >> 1]) - 128;
+                const int E = int(vr[i >> 1]) - 128;
+                row[i * 4 + 0] = cl((298 * C + 409 * E + 128) >> 8);
+                row[i * 4 + 1] = cl((298 * C - 100 * D - 208 * E + 128) >> 8);
+                row[i * 4 + 2] = cl((298 * C + 516 * D + 128) >> 8);
+            }
+        }
+    }
+    void rewind() override {
+        if ( havePic ) { dav1d_picture_unref(&pic); havePic = false; }
+        if ( pending.sz ) dav1d_data_unref(&pending);
+        if ( ctx ) dav1d_flush(ctx);
+        if ( fp ) fseek(fp, 32, SEEK_SET);   // back to the first packet (past the 32-byte header)
+        eof = false; endedFlag = false;
+    }
+    bool hasAudio() const override { return false; }   // IVF/AV1 elementary stream carries no audio
+    bool enableAudio() override { return false; }
+    int  audioChannels() const override { return 0; }
+    bool decodeAudio() override { return false; }
+    bool currentAudio(AudioBatchView &) const override { return false; }
+};
+
+// Format dispatch: peek the first 4 bytes. "DKIF" => an IVF (AV1) stream => dav1d;
+// anything else falls through to pl_mpeg.
 static VideoSource * createSourceFor(const char * filename) {
+    FILE * f = fopen(filename, "rb");
+    if ( f ) {
+        char magic[4] = {0};
+        const size_t n = fread(magic, 1, 4, f);
+        fclose(f);
+        if ( n == 4 && memcmp(magic, "DKIF", 4) == 0 ) return Av1Source::tryOpen(filename);
+    }
     return PlmSource::tryOpen(filename);
 }
 

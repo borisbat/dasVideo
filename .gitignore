@@ -3,6 +3,9 @@ _build/
 build/
 out/
 
+# dav1d source: FetchContent'd at build time (pinned tarball), never committed
+vendor/dav1d/
+
 # native module artifacts
 *.shared_module
 *.lib

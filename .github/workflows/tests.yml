@@ -115,6 +115,14 @@ jobs:
             -load_module "${GITHUB_WORKSPACE}/dasVideo" \
             "${GITHUB_WORKSPACE}/dasVideo/tests/test_audio.das"
 
+      - name: "Headless smoke (AV1 decode via dav1d)"
+        working-directory: ${{ github.workspace }}/dasVideo
+        run: |
+          set -eux
+          "${GITHUB_WORKSPACE}/daslang-src/bin/daslang" \
+            -load_module "${GITHUB_WORKSPACE}/dasVideo" \
+            "${GITHUB_WORKSPACE}/dasVideo/tests/test_av1.das"
+
       - name: "Tutorial gates (every tutorials/*/test_*.das)"
         # Each tutorial ships a headless self-verifying test. Run from the repo
         # root so the tutorials' relative fixture paths resolve. The loop scales
