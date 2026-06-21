@@ -1,0 +1,74 @@
+name: Build documentation
+
+# Builds the Sphinx site and deploys it to GitHub Pages. dasVideo's docs are
+# hand-written RST (no generator, unlike dasVulkan's vulkan2rst), so this needs
+# NO daslang build and NO native module — just sphinx-build + deploy.
+#
+# Build runs on every push/PR (so doc breakage is caught in review); deploy only
+# runs on master and is the only job carrying the github-pages environment.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# One Pages deployment at a time.
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: "Checkout dasVideo"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Install Sphinx"
+        run: pip install sphinx alabaster
+
+      - name: "Build Sphinx HTML"
+        # -W: warnings are errors (the das lexer / broken refs fail the build).
+        run: |
+          set -eux
+          sphinx-build -W --keep-going -b html -d build/sphinx-cache doc/source build/site
+
+      - name: "Stage site"
+        run: |
+          set -eux
+          mkdir -p _site
+          cp -r build/site/. _site/
+          # Disable Jekyll so Pages keeps Sphinx's underscore-prefixed asset dirs
+          # (_static/, _sources/, ...).
+          touch _site/.nojekyll
+
+      - name: "Upload Pages artifact"
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: "Deploy to GitHub Pages"
+        id: deployment
+        uses: actions/deploy-pages@v4
