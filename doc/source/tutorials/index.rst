@@ -9,3 +9,4 @@ that doubles as its runnable demo and its CI gate.
    :maxdepth: 1
 
    01_open_probe
+   02_decode_rgba
