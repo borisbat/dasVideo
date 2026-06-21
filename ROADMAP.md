@@ -20,11 +20,14 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## P1 — pl_mpeg video (headless)
 
-- [ ] `open(file)` → `VideoPlayer` handle; plain frame-info struct (w/h/strides/pts)
-- [ ] decode → native YUV420p planes
-- [ ] `get_data` block accessor — YUV planes (zero-copy)
-- [ ] C++ YUV→RGB converter; `get_data` block accessor — RGBA8
-- [ ] headless test: decode N frames + checksum; green on all 3 OSes
+- [x] `video_open` → `VideoPlayer` handle (opaque); info via getters
+      (width/height/framerate/samplerate/duration/frame_time, y/uv strides). A plain
+      frame-info struct is ergonomic sugar deferred to the daslib boost layer.
+- [x] `video_decode` → native YUV420p planes (borrow-until-next-decode)
+- [x] `get_data` block accessor — YUV planes (zero-copy `array<uint8>#` views)
+- [x] C++ YUV→RGB converter (`plm_frame_to_rgba`); `get_data` — RGBA8
+- [~] headless decode-N-frames + checksum test (green: local Windows + CI Linux/macOS;
+      Windows CI shares P0's fast-follow)
 
 ## P2 — GL output
 
