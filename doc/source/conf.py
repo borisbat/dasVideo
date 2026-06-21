@@ -3,18 +3,39 @@
 # dasVideo documentation build configuration.
 #
 # Vendored from daslang/doc/source/conf.py via dasVulkan/dasImgui — HTML-only
-# (Pages deploy), and trimmed of the vulkan2rst generator + tutorial-video bits
-# dasVideo doesn't have yet. Reconcile against the daslang upstream when the
-# daslang Sphinx domain / Forge theme evolves.
+# (Pages deploy), trimmed of the vulkan2rst generator. Reconcile against the daslang
+# upstream when the daslang Sphinx domain / Forge theme evolves.
 
 import sys
 import os
 import time
 
-# Make the vendored `daslang` Sphinx domain (das lexer + das: directives) importable.
+# Make the vendored `daslang` Sphinx domain + `tutorial_video` directive importable.
 sys.path.insert(0, os.path.abspath('.'))
 
-extensions = ['daslang', 'sphinx.ext.intersphinx']
+# Tutorial recordings (.mp4) live next to each tutorial under <repo>/tutorials/<name>/.
+# Copy them into _static/tutorials/ at build time so the `.. video::` directive can
+# serve them by basename; the copies are gitignored. Runs at conf load, before the build.
+import shutil as _shutil
+import glob as _glob
+_conf_dir = os.path.abspath(os.path.dirname(__file__))
+_repo_root = os.path.abspath(os.path.join(_conf_dir, '..', '..'))
+_video_dst = os.path.join(_conf_dir, '_static', 'tutorials')
+os.makedirs(_video_dst, exist_ok=True)
+_seen_videos = {}
+for _mp4 in _glob.glob(os.path.join(_repo_root, 'tutorials', '**', '*.mp4'), recursive=True):
+    _base = os.path.basename(_mp4)
+    # `.. video::` serves by basename, so a name collision would embed the wrong clip.
+    # Fail loudly instead; each tutorial's recording must be uniquely named.
+    if _base in _seen_videos:
+        raise RuntimeError(
+            "tutorial video basename collision: %r and %r both map to "
+            "_static/tutorials/%s -- give each recording a unique name"
+            % (_seen_videos[_base], _mp4, _base))
+    _seen_videos[_base] = _mp4
+    _shutil.copy2(_mp4, os.path.join(_video_dst, _base))
+
+extensions = ['daslang', 'tutorial_video', 'sphinx.ext.intersphinx']
 
 # Resolve cross-refs to daslang core against the published daslang docs.
 intersphinx_mapping = {

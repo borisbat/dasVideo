@@ -6,6 +6,8 @@ The smallest useful dasVideo step: open an MPEG-1 file and read back **what it i
 decoding yet, no window; just the opaque ``VideoPlayer?`` handle and the cheap info
 getters. Everything later builds on this.
 
+.. video:: 01_open_probe.mp4
+
 The library
 -----------
 

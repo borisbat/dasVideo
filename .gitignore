@@ -23,6 +23,8 @@ __pycache__/
 *.pyc
 _site/
 doc/build/
+# tutorial recordings copied in by conf.py (source mp4s live in tutorials/<name>/)
+doc/source/_static/tutorials/
 
 # daspkg install dir + lockfile (created by `daspkg install`)
 modules/
