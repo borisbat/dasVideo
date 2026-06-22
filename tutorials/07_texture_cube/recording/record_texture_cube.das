@@ -126,7 +126,7 @@ def render_and_capture(data : array<uint8>; apng : string; n_frames, frame_ms : 
         }
         upload_current_frame(player, vw, vh)
         glViewport(0, 0, REC, REC)
-        let angle = 0.7f + float(frame) * 0.015f   // deterministic spin (~1.3 turns over 18s)
+        let angle = 0.7f + float(frame) * 0.015f   // deterministic spin (~1.7 turns over 24s)
         draw_cube(angle, 1.0)
         glFinish()
         var px : array<uint8>

@@ -23,11 +23,12 @@ require stbimage
 require daslib/fio
 require math
 
-// The APNG writer flips rows top-down for GL glReadPixels (bottom-up) data; our cube
-// frames are read back with glReadPixels (bottom-up), so we pass them through as-is
-// and let the writer's flip orient them. capture_apng pre-flips, which cancels the
-// writer's flip — so the driver must hand us TOP-DOWN rows (flip glReadPixels output
-// once before returning, the same convention dasVulkan's top-down readback uses).
+// capture_apng pre-flips every frame, and the stbi APNG writer flips again internally
+// (it is built for GL glReadPixels bottom-up data) — the two flips cancel, so whatever
+// the render block returns is exactly what lands in the PNG. The block must therefore
+// hand back TOP-DOWN rows: glReadPixels is bottom-up, so a GL driver flips its readback
+// once before returning (dasVulkan's Vulkan readback is already top-down, so it returns
+// as-is — same contract).
 def private flip_rows_inplace(var pixels : array<uint8>; w, h : int) {
     let row = w * 4
     for (y in range(h / 2)) {
