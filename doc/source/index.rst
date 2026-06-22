@@ -10,6 +10,10 @@ permissively-licensed codecs only.
 The design in one breath: **the player owns the decoded data, the consumer borrows it**
 through RAII block accessors; **audio is the master clock** and video is paced to it.
 
+**Source code**: https://github.com/borisbat/dasVideo
+
+**Issues**: https://github.com/borisbat/dasVideo/issues
+
 .. code-block:: text
 
     daslang -load_module <repo> examples/play_audio_gl.das    # Emma introduces dasVideo
