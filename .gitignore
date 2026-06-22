@@ -3,8 +3,10 @@ _build/
 build/
 out/
 
-# dav1d source: FetchContent'd at build time (pinned tarball), never committed
+# decode-backend sources: FetchContent'd at build time (pinned), never committed
 vendor/dav1d/
+vendor/nestegg/
+vendor/opus/
 
 # native module artifacts
 *.shared_module

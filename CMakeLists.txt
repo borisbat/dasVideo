@@ -18,6 +18,8 @@ option(DAS_VIDEO_DAV1D "AV1 decode via dav1d (fetches + compiles dav1d from sour
 if(DAS_VIDEO_DAV1D)
     # dav1d (AV1) backend — pinned source fetched + compiled C-only, no meson.
     include(${DAS_VIDEO_DIR}/cmake/BuildDav1d.cmake)
+    # WebM container (AV1 video + Opus audio): nestegg demux + libopus, same vendoring.
+    include(${DAS_VIDEO_DIR}/cmake/BuildWebm.cmake)
 endif()
 
 # pl_mpeg (single header) is compiled into the module TU via PL_MPEG_IMPLEMENTATION.
@@ -39,7 +41,8 @@ target_include_directories(dasModuleVideo PRIVATE
     ${DAS_VIDEO_DIR}/src
 )
 if(DAS_VIDEO_DAV1D)
-    target_link_libraries(dasModuleVideo PRIVATE dav1d_dec)
+    target_link_libraries(dasModuleVideo PRIVATE dav1d_dec nestegg_dec opus)
+    target_include_directories(dasModuleVideo PRIVATE ${DAS_VIDEO_DIR}/vendor/opus/include)
     target_compile_definitions(dasModuleVideo PRIVATE DAS_VIDEO_WITH_DAV1D)
 endif()
 if(WIN32)

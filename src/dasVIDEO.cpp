@@ -27,7 +27,10 @@
 
 #ifdef DAS_VIDEO_WITH_DAV1D
 #include <cerrno>
+#include <deque>
 #include <dav1d/dav1d.h>
+#include <nestegg/nestegg.h>
+#include <opus.h>
 #endif
 
 namespace das {
@@ -173,13 +176,33 @@ struct ByteSource {
     FILE * fp = nullptr;
     const uint8_t * mem = nullptr;
     size_t size = 0, pos = 0;
-    bool read(void * dst, size_t n) {
+    bool read(void * dst, size_t n) {   // all-or-nothing (IVF fixed-size reads)
         if ( fp ) return fread(dst, 1, n, fp) == n;
         if ( !mem || pos + n > size ) return false;
         memcpy(dst, mem + pos, n);
         pos += n;
         return true;
     }
+    // Short-read variant for nestegg's buffered IO: bytes read, 0 = EOF, -1 = error.
+    int64_t readSome(void * dst, size_t n) {
+        if ( fp ) return int64_t(fread(dst, 1, n, fp));
+        if ( !mem ) return -1;
+        const size_t avail = pos < size ? size - pos : 0;
+        const size_t take = n < avail ? n : avail;
+        if ( take ) { memcpy(dst, mem + pos, take); pos += take; }
+        return int64_t(take);
+    }
+    // nestegg seek (whence == SEEK_SET/CUR/END): 0 ok, -1 error.
+    int seekTo(int64_t off, int whence) {
+        if ( fp ) return fseek(fp, long(off), whence) == 0 ? 0 : -1;
+        const int64_t base = whence == SEEK_CUR ? int64_t(pos)
+                           : (whence == SEEK_END ? int64_t(size) : int64_t(0));
+        const int64_t np = base + off;
+        if ( np < 0 || np > int64_t(size) ) return -1;
+        pos = size_t(np);
+        return 0;
+    }
+    int64_t tell() const { return fp ? int64_t(ftell(fp)) : int64_t(pos); }
     void seekStart(size_t off) {   // absolute seek from the start (used by rewind)
         if ( fp ) fseek(fp, long(off), SEEK_SET);
         else pos = off;
@@ -187,15 +210,80 @@ struct ByteSource {
     void close() { if ( fp ) { fclose(fp); fp = nullptr; } mem = nullptr; }
 };
 
-struct Av1Source final : VideoSource {
-    ByteSource bs;
+// Shared dav1d picture pipeline used by both AV1 backends (the IVF elementary
+// stream and the WebM container). Owns the decoder context + the current decoded
+// picture and the YUV->RGBA conversion; each backend feeds it AV1 OBU packets from
+// its own demuxer. Tier-1 per ORIGINAL_PLAN: 8-bit 4:2:0 only; anything else fails
+// closed with a clear message.
+struct Dav1dDecoder {
     Dav1dContext * ctx = nullptr;
-    Dav1dData pending{};        // current packet being fed; .sz == 0 when empty
     Dav1dPicture pic{};
     bool havePic = false;
+    bool unsupported = false;   // set once if a decoded frame isn't 8-bit 4:2:0
+
+    bool open() {
+        Dav1dSettings settings;
+        dav1d_default_settings(&settings);
+        return dav1d_open(&ctx, &settings) == 0;
+    }
+    ~Dav1dDecoder() {
+        if ( havePic ) dav1d_picture_unref(&pic);
+        if ( ctx ) dav1d_close(&ctx);
+    }
+    void unrefPic() { if ( havePic ) { dav1d_picture_unref(&pic); havePic = false; } }
+    void flush() { unrefPic(); if ( ctx ) dav1d_flush(ctx); }
+
+    // Validate the picture dav1d_get_picture just wrote into `pic` (after it returned
+    // 0). Accepts it (havePic = true) or fails closed if it isn't 8-bit 4:2:0.
+    bool acceptPic() {
+        if ( pic.p.layout != DAV1D_PIXEL_LAYOUT_I420 || pic.p.bpc != 8 ) {
+            fprintf(stderr, "dasVideo: AV1 stream is %d-bit, pixel layout %d; "
+                    "only 8-bit 4:2:0 is supported\n", pic.p.bpc, int(pic.p.layout));
+            dav1d_picture_unref(&pic);
+            unsupported = true;
+            return false;
+        }
+        havePic = true;
+        return true;
+    }
+    // Borrow the current frame's native YUV planes; the backend supplies the pts
+    // (each computes it from its own timebase).
+    void fillFrame(VideoFrameView & v, double pts) const {
+        v.y  = (const uint8_t *)pic.data[0]; v.yW = int(pic.stride[0]); v.yH = pic.p.h;
+        v.cb = (const uint8_t *)pic.data[1]; v.cr = (const uint8_t *)pic.data[2];
+        v.cW = int(pic.stride[1]); v.cH = (pic.p.h + 1) / 2;
+        v.pts = pts;
+    }
+    // BT.601 limited-range YUV420 -> RGB (alpha left as the caller's pre-filled 0xFF).
+    void convertRgba(uint8_t * dst, int dstStride, int w, int h) const {
+        const uint8_t * yp = (const uint8_t *)pic.data[0];
+        const uint8_t * up = (const uint8_t *)pic.data[1];
+        const uint8_t * vp = (const uint8_t *)pic.data[2];
+        const int ys = int(pic.stride[0]), cs = int(pic.stride[1]);
+        auto cl = [](int x) { return uint8_t(x < 0 ? 0 : (x > 255 ? 255 : x)); };
+        for ( int j = 0; j < h; ++j ) {
+            uint8_t * row = dst + j * dstStride;
+            const uint8_t * yr = yp + j * ys;
+            const uint8_t * ur = up + (j >> 1) * cs;
+            const uint8_t * vr = vp + (j >> 1) * cs;
+            for ( int i = 0; i < w; ++i ) {
+                const int C = int(yr[i]) - 16;
+                const int D = int(ur[i >> 1]) - 128;
+                const int E = int(vr[i >> 1]) - 128;
+                row[i * 4 + 0] = cl((298 * C + 409 * E + 128) >> 8);
+                row[i * 4 + 1] = cl((298 * C - 100 * D - 208 * E + 128) >> 8);
+                row[i * 4 + 2] = cl((298 * C + 516 * D + 128) >> 8);
+            }
+        }
+    }
+};
+
+struct Av1Source final : VideoSource {
+    ByteSource bs;
+    Dav1dDecoder dec;
+    Dav1dData pending{};        // current packet being fed; .sz == 0 when empty
     bool eof = false;
     bool endedFlag = false;
-    bool unsupported = false;   // set once if the stream isn't 8-bit 4:2:0
     int w = 0, h = 0;
     uint32_t tbNum = 0, tbDen = 0, nFrames = 0;   // IVF timebase + header frame count
 
@@ -212,13 +300,9 @@ struct Av1Source final : VideoSource {
             bs.close();
             return nullptr;
         }
-        Dav1dSettings settings;
-        dav1d_default_settings(&settings);
-        Dav1dContext * ctx = nullptr;
-        if ( dav1d_open(&ctx, &settings) != 0 ) { bs.close(); return nullptr; }
         auto * s = new Av1Source();
+        if ( !s->dec.open() ) { bs.close(); delete s; return nullptr; }
         s->bs = bs;
-        s->ctx = ctx;
         s->w = int(hdr[12] | (hdr[13] << 8));
         s->h = int(hdr[14] | (hdr[15] << 8));
         s->tbNum = rd32(hdr + 16);
@@ -239,9 +323,7 @@ struct Av1Source final : VideoSource {
         return openFrom(bs);
     }
     ~Av1Source() override {
-        if ( havePic ) dav1d_picture_unref(&pic);
         if ( pending.sz ) dav1d_data_unref(&pending);
-        if ( ctx ) dav1d_close(&ctx);
         bs.close();
     }
 
@@ -266,26 +348,19 @@ struct Av1Source final : VideoSource {
     bool   ended() const override      { return endedFlag; }
 
     bool decodeVideo() override {
-        if ( unsupported || !ctx ) return false;
-        if ( havePic ) { dav1d_picture_unref(&pic); havePic = false; }
+        if ( dec.unsupported || !dec.ctx ) return false;
+        dec.unrefPic();
         for ( ;; ) {
             if ( pending.sz == 0 && !eof ) {
                 if ( !readPacket() ) eof = true;
             }
             if ( pending.sz > 0 ) {
-                const int r = dav1d_send_data(ctx, &pending);
+                const int r = dav1d_send_data(dec.ctx, &pending);
                 if ( r < 0 && r != DAV1D_ERR(EAGAIN) ) { endedFlag = true; return false; }
             }
-            const int rp = dav1d_get_picture(ctx, &pic);
+            const int rp = dav1d_get_picture(dec.ctx, &dec.pic);
             if ( rp == 0 ) {
-                if ( pic.p.layout != DAV1D_PIXEL_LAYOUT_I420 || pic.p.bpc != 8 ) {
-                    fprintf(stderr, "dasVideo: AV1 stream is %d-bit, pixel layout %d; "
-                            "only 8-bit 4:2:0 is supported\n", pic.p.bpc, int(pic.p.layout));
-                    dav1d_picture_unref(&pic);
-                    unsupported = true; endedFlag = true;
-                    return false;
-                }
-                havePic = true;
+                if ( !dec.acceptPic() ) { endedFlag = true; return false; }
                 return true;
             }
             if ( rp == DAV1D_ERR(EAGAIN) ) {
@@ -297,40 +372,17 @@ struct Av1Source final : VideoSource {
         }
     }
     bool currentFrame(VideoFrameView & v) const override {
-        if ( !havePic ) return false;
-        v.y  = (const uint8_t *)pic.data[0]; v.yW = int(pic.stride[0]); v.yH = pic.p.h;
-        v.cb = (const uint8_t *)pic.data[1]; v.cr = (const uint8_t *)pic.data[2];
-        v.cW = int(pic.stride[1]); v.cH = (pic.p.h + 1) / 2;
-        v.pts = tbNum ? double(pic.m.timestamp) * double(tbDen) / double(tbNum) : 0.0;
+        if ( !dec.havePic ) return false;
+        const double pts = tbNum ? double(dec.pic.m.timestamp) * double(tbDen) / double(tbNum) : 0.0;
+        dec.fillFrame(v, pts);
         return true;
     }
-    // BT.601 limited-range YUV420 -> RGB (alpha left as the caller's pre-filled 0xFF).
     void convertRgba(uint8_t * dst, int dstStride) const override {
-        if ( !havePic ) return;
-        const uint8_t * yp = (const uint8_t *)pic.data[0];
-        const uint8_t * up = (const uint8_t *)pic.data[1];
-        const uint8_t * vp = (const uint8_t *)pic.data[2];
-        const int ys = int(pic.stride[0]), cs = int(pic.stride[1]);
-        auto cl = [](int x) { return uint8_t(x < 0 ? 0 : (x > 255 ? 255 : x)); };
-        for ( int j = 0; j < h; ++j ) {
-            uint8_t * row = dst + j * dstStride;
-            const uint8_t * yr = yp + j * ys;
-            const uint8_t * ur = up + (j >> 1) * cs;
-            const uint8_t * vr = vp + (j >> 1) * cs;
-            for ( int i = 0; i < w; ++i ) {
-                const int C = int(yr[i]) - 16;
-                const int D = int(ur[i >> 1]) - 128;
-                const int E = int(vr[i >> 1]) - 128;
-                row[i * 4 + 0] = cl((298 * C + 409 * E + 128) >> 8);
-                row[i * 4 + 1] = cl((298 * C - 100 * D - 208 * E + 128) >> 8);
-                row[i * 4 + 2] = cl((298 * C + 516 * D + 128) >> 8);
-            }
-        }
+        if ( dec.havePic ) dec.convertRgba(dst, dstStride, w, h);
     }
     void rewind() override {
-        if ( havePic ) { dav1d_picture_unref(&pic); havePic = false; }
+        dec.flush();
         if ( pending.sz ) dav1d_data_unref(&pending);
-        if ( ctx ) dav1d_flush(ctx);
         bs.seekStart(32);   // back to the first packet (past the 32-byte header)
         eof = false; endedFlag = false;
     }
@@ -340,14 +392,256 @@ struct Av1Source final : VideoSource {
     bool decodeAudio() override { return false; }
     bool currentAudio(AudioBatchView &) const override { return false; }
 };
+
+// ===== WebM (AV1 video + Opus audio) backend =====
+
+// Demuxes a WebM/Matroska container (nestegg) carrying an AV1 video track and an
+// optional Opus audio track. AV1 frames decode through the shared Dav1dDecoder
+// (same as the IVF path); Opus packets decode through libopus to interleaved float
+// PCM at 48 kHz. nestegg yields a single interleaved packet stream, so a packet for
+// the track we're not currently draining is queued for the other decode call.
+struct WebmSource final : VideoSource {
+    ByteSource bs;
+    nestegg * ne = nullptr;
+    Dav1dDecoder dec;
+
+    int videoTrack = -1, audioTrack = -1;
+    int w = 0, h = 0;
+    double fps = 0.0;
+    double durationSec = 0.0;
+
+    // demux queues: whichever track a read packet belongs to, the other consumer's
+    // packets wait here. Audio is only queued once enabled (video-only playback
+    // never buffers it).
+    struct EncPkt { std::vector<uint8_t> data; uint64_t tstampNs = 0; };
+    std::deque<EncPkt> videoPkts, audioPkts;
+    Dav1dData pending{};        // video OBU buffer currently feeding dav1d
+    bool containerEof = false;
+    bool endedFlag = false;
+
+    // opus
+    OpusDecoder * opus = nullptr;
+    int opusChannels = 0;
+    bool audioEnabled = false;
+    std::vector<float> audioBuf;   // decoded interleaved float PCM (player-owned)
+    int audioCount = 0;            // frames-per-channel currently in audioBuf
+    double audioPts = 0.0;
+
+    // nestegg IO callbacks over a ByteSource userdata.
+    static int64_t io_read(void * buf, size_t len, void * ud) { return ((ByteSource *)ud)->readSome(buf, len); }
+    static int     io_seek(int64_t off, int whence, void * ud) { return ((ByteSource *)ud)->seekTo(off, whence); }
+    static int64_t io_tell(void * ud) { return ((ByteSource *)ud)->tell(); }
+
+    static WebmSource * openFrom(ByteSource bs) {
+        auto * s = new WebmSource();
+        s->bs = bs;   // heap-stable address for nestegg's userdata
+        nestegg_io io;
+        io.read = io_read; io.seek = io_seek; io.tell = io_tell;
+        io.userdata = &s->bs;
+        if ( nestegg_init(&s->ne, io, nullptr, -1) != 0 ) { s->ne = nullptr; delete s; return nullptr; }
+        unsigned int nTracks = 0;
+        nestegg_track_count(s->ne, &nTracks);
+        for ( unsigned int t = 0; t < nTracks; ++t ) {
+            const int type = nestegg_track_type(s->ne, t);
+            const int codec = nestegg_track_codec_id(s->ne, t);
+            if ( type == NESTEGG_TRACK_VIDEO && codec == NESTEGG_CODEC_AV1 && s->videoTrack < 0 ) {
+                s->videoTrack = int(t);
+                nestegg_video_params vp;
+                if ( nestegg_track_video_params(s->ne, t, &vp) == 0 ) {
+                    s->w = int(vp.width); s->h = int(vp.height);
+                }
+                uint64_t dd = 0;
+                if ( nestegg_track_default_duration(s->ne, t, &dd) == 0 && dd > 0 )
+                    s->fps = 1e9 / double(dd);
+            } else if ( type == NESTEGG_TRACK_AUDIO && codec == NESTEGG_CODEC_OPUS && s->audioTrack < 0 ) {
+                s->audioTrack = int(t);
+                nestegg_audio_params ap;
+                s->opusChannels = (nestegg_track_audio_params(s->ne, t, &ap) == 0 && ap.channels > 0)
+                                ? int(ap.channels) : 2;
+            }
+        }
+        if ( s->videoTrack < 0 ) {
+            fprintf(stderr, "dasVideo: WebM has no AV1 video track (VP8/VP9 not supported)\n");
+            delete s; return nullptr;
+        }
+        if ( !s->dec.open() ) { delete s; return nullptr; }
+        s->seedDav1d();
+        uint64_t durNs = 0;
+        if ( nestegg_duration(s->ne, &durNs) == 0 ) s->durationSec = double(durNs) / 1e9;
+        return s;
+    }
+    static WebmSource * tryOpen(const char * filename) {
+        ByteSource bs;
+        bs.fp = fopen(filename, "rb");
+        if ( !bs.fp ) return nullptr;
+        return openFrom(bs);
+    }
+    // Reference the caller's bytes (no copy) — the buffer must outlive the player.
+    static WebmSource * tryOpenMemory(const uint8_t * data, size_t size) {
+        ByteSource bs;
+        bs.mem = data; bs.size = size; bs.pos = 0;
+        return openFrom(bs);
+    }
+    ~WebmSource() override {
+        if ( pending.sz ) dav1d_data_unref(&pending);
+        if ( opus ) opus_decoder_destroy(opus);
+        if ( ne ) nestegg_destroy(ne);
+        bs.close();
+    }
+
+    // Seed dav1d with the av1C configOBUs (best-effort): some muxers keep the
+    // sequence header only in CodecPrivate. Redundant with keyframes that also carry
+    // it, which dav1d tolerates; errors are ignored (keyframes will seed regardless).
+    void seedDav1d() {
+        unsigned char * cd = nullptr; size_t cl = 0;
+        if ( nestegg_track_codec_data(ne, unsigned(videoTrack), 0, &cd, &cl) != 0 ) return;
+        if ( !cd || cl <= 4 ) return;   // 4-byte AV1CodecConfigurationRecord header, then OBUs
+        Dav1dData d{};
+        uint8_t * buf = dav1d_data_create(&d, cl - 4);
+        if ( !buf ) return;
+        memcpy(buf, cd + 4, cl - 4);
+        dav1d_send_data(dec.ctx, &d);
+        if ( d.sz ) dav1d_data_unref(&d);
+    }
+
+    // Read one container packet; route its chunks to the matching queue (audio only
+    // when enabled). Returns false at container EOF / error (sets containerEof).
+    bool readMorePackets() {
+        nestegg_packet * pkt = nullptr;
+        const int r = nestegg_read_packet(ne, &pkt);
+        if ( r <= 0 ) { containerEof = true; return false; }
+        unsigned int track = 0;
+        nestegg_packet_track(pkt, &track);
+        uint64_t ts = 0;
+        nestegg_packet_tstamp(pkt, &ts);
+        std::deque<EncPkt> * q = nullptr;
+        if ( int(track) == videoTrack ) q = &videoPkts;
+        else if ( audioEnabled && int(track) == audioTrack ) q = &audioPkts;
+        if ( q ) {
+            unsigned int chunks = 0;
+            nestegg_packet_count(pkt, &chunks);
+            for ( unsigned int c = 0; c < chunks; ++c ) {
+                unsigned char * d = nullptr; size_t n = 0;
+                if ( nestegg_packet_data(pkt, c, &d, &n) == 0 && n > 0 )
+                    q->push_back(EncPkt{ std::vector<uint8_t>(d, d + n), ts });
+            }
+        }
+        nestegg_free_packet(pkt);
+        return true;
+    }
+    // Ensure `pending` holds the next video OBU buffer (reading container packets as
+    // needed). Leaves pending.sz == 0 at the end of the video stream.
+    void refillPending() {
+        while ( videoPkts.empty() && !containerEof ) {
+            if ( !readMorePackets() ) break;
+        }
+        if ( videoPkts.empty() ) return;
+        EncPkt p = std::move(videoPkts.front());
+        videoPkts.pop_front();
+        uint8_t * buf = dav1d_data_create(&pending, p.data.size());
+        if ( !buf ) return;
+        memcpy(buf, p.data.data(), p.data.size());
+        pending.m.timestamp = int64_t(p.tstampNs);
+    }
+
+    int    width() const override      { return w; }
+    int    height() const override     { return h; }
+    double framerate() const override  { return fps; }
+    int    samplerate() const override { return audioTrack >= 0 ? 48000 : 0; }   // opus output rate
+    double duration() const override   { return durationSec; }
+    bool   ended() const override      { return endedFlag; }
+
+    bool decodeVideo() override {
+        if ( dec.unsupported || !dec.ctx ) return false;
+        dec.unrefPic();
+        for ( ;; ) {
+            if ( pending.sz == 0 ) refillPending();
+            if ( pending.sz > 0 ) {
+                const int r = dav1d_send_data(dec.ctx, &pending);
+                if ( r < 0 && r != DAV1D_ERR(EAGAIN) ) { endedFlag = true; return false; }
+            }
+            const int rp = dav1d_get_picture(dec.ctx, &dec.pic);
+            if ( rp == 0 ) {
+                if ( !dec.acceptPic() ) { endedFlag = true; return false; }
+                return true;
+            }
+            if ( rp == DAV1D_ERR(EAGAIN) ) {
+                if ( pending.sz == 0 && videoPkts.empty() && containerEof ) { endedFlag = true; return false; }
+                continue;
+            }
+            endedFlag = true;   // hard decode error
+            return false;
+        }
+    }
+    bool currentFrame(VideoFrameView & v) const override {
+        if ( !dec.havePic ) return false;
+        dec.fillFrame(v, double(dec.pic.m.timestamp) / 1e9);   // nestegg timestamps are ns
+        return true;
+    }
+    void convertRgba(uint8_t * dst, int dstStride) const override {
+        if ( dec.havePic ) dec.convertRgba(dst, dstStride, w, h);
+    }
+    void rewind() override {
+        dec.flush();
+        if ( pending.sz ) dav1d_data_unref(&pending);
+        videoPkts.clear(); audioPkts.clear();
+        if ( opus ) opus_decoder_ctl(opus, OPUS_RESET_STATE);
+        audioCount = 0;
+        containerEof = false; endedFlag = false;
+        nestegg_track_seek(ne, unsigned(videoTrack), 0);   // back to the first keyframe
+    }
+    bool hasAudio() const override { return audioTrack >= 0; }
+    bool enableAudio() override {
+        if ( audioTrack < 0 ) return false;
+        if ( audioEnabled ) return true;
+        int err = 0;
+        opus = opus_decoder_create(48000, opusChannels, &err);   // opus: 1 or 2 channels
+        if ( err != OPUS_OK || !opus ) { opus = nullptr; return false; }
+        audioEnabled = true;
+        return true;
+    }
+    int audioChannels() const override { return opusChannels; }
+    bool decodeAudio() override {
+        if ( !audioEnabled || !opus ) return false;
+        for ( ;; ) {
+            while ( audioPkts.empty() ) {
+                if ( containerEof ) return false;
+                if ( !readMorePackets() ) return false;
+            }
+            EncPkt p = std::move(audioPkts.front());
+            audioPkts.pop_front();
+            const size_t need = size_t(5760) * size_t(opusChannels);   // 120ms @ 48kHz, max opus frame
+            if ( audioBuf.size() < need ) audioBuf.resize(need);
+            const int n = opus_decode_float(opus, p.data.data(), int(p.data.size()),
+                                            audioBuf.data(), 5760, 0);
+            if ( n < 0 ) continue;   // skip an undecodable packet
+            audioCount = n;
+            audioPts = double(p.tstampNs) / 1e9;
+            return true;
+        }
+    }
+    bool currentAudio(AudioBatchView & a) const override {
+        if ( audioCount <= 0 ) return false;
+        a.interleaved = audioBuf.data();
+        a.count = audioCount;
+        a.pts = audioPts;
+        return true;
+    }
+};
 #endif // DAS_VIDEO_WITH_DAV1D
 
-// Format dispatch: peek the first 4 bytes. "DKIF" => an IVF (AV1) stream => dav1d
-// (when built); anything else falls through to pl_mpeg.
+// True if the 4-byte magic is the EBML signature that starts every WebM/Matroska file.
+static bool isEbmlMagic(const uint8_t * m) {
+    return m[0] == 0x1A && m[1] == 0x45 && m[2] == 0xDF && m[3] == 0xA3;
+}
+
+// Format dispatch: peek the first 4 bytes. "DKIF" => an IVF (AV1) elementary stream;
+// EBML (0x1A45DFA3) => a WebM container (AV1 video + Opus audio) — both go through
+// dav1d (when built). Anything else falls through to pl_mpeg.
 static VideoSource * createSourceFor(const char * filename) {
     FILE * f = fopen(filename, "rb");
     if ( f ) {
-        char magic[4] = {0};
+        uint8_t magic[4] = {0};
         const size_t n = fread(magic, 1, 4, f);
         fclose(f);
         if ( n == 4 && memcmp(magic, "DKIF", 4) == 0 ) {
@@ -359,20 +653,40 @@ static VideoSource * createSourceFor(const char * filename) {
             return nullptr;
 #endif
         }
+        if ( n == 4 && isEbmlMagic(magic) ) {
+#ifdef DAS_VIDEO_WITH_DAV1D
+            return WebmSource::tryOpen(filename);
+#else
+            fprintf(stderr, "dasVideo: '%s' is a WebM stream, but this build has no "
+                    "WebM/AV1 support (rebuild with -DDAS_VIDEO_DAV1D=ON)\n", filename);
+            return nullptr;
+#endif
+        }
     }
     return PlmSource::tryOpen(filename);
 }
 
 // In-memory dispatch: the same magic-byte probe on a borrowed buffer (no copy).
 static VideoSource * createSourceForMemory(const uint8_t * data, size_t size) {
-    if ( data && size >= 4 && memcmp(data, "DKIF", 4) == 0 ) {
+    if ( data && size >= 4 ) {
+        if ( memcmp(data, "DKIF", 4) == 0 ) {
 #ifdef DAS_VIDEO_WITH_DAV1D
-        return Av1Source::tryOpenMemory(data, size);
+            return Av1Source::tryOpenMemory(data, size);
 #else
-        fprintf(stderr, "dasVideo: in-memory AV1 (IVF) stream, but this build has no "
-                "AV1 support (rebuild with -DDAS_VIDEO_DAV1D=ON)\n");
-        return nullptr;
+            fprintf(stderr, "dasVideo: in-memory AV1 (IVF) stream, but this build has no "
+                    "AV1 support (rebuild with -DDAS_VIDEO_DAV1D=ON)\n");
+            return nullptr;
 #endif
+        }
+        if ( isEbmlMagic(data) ) {
+#ifdef DAS_VIDEO_WITH_DAV1D
+            return WebmSource::tryOpenMemory(data, size);
+#else
+            fprintf(stderr, "dasVideo: in-memory WebM stream, but this build has no "
+                    "WebM/AV1 support (rebuild with -DDAS_VIDEO_DAV1D=ON)\n");
+            return nullptr;
+#endif
+        }
     }
     return PlmSource::tryOpenMemory(data, size);
 }

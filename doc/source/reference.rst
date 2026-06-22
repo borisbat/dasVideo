@@ -14,8 +14,14 @@ Lifecycle
 
     video_open(filename : string) : VideoPlayer?
 
-Open a video file — an MPEG-1 ``.mpg``, or an AV1 ``.ivf`` when the module is built
-with dav1d (the default; ``DAS_VIDEO_DAV1D``). The container format is auto-detected.
+Open a video file. Three container formats are auto-detected from the file's magic
+bytes:
+
+- **MPEG-1** ``.mpg`` — pl_mpeg, always available (MPEG-1 video + MP2 audio).
+- **AV1 IVF** ``.ivf`` — dav1d, video only.
+- **WebM** ``.webm`` — nestegg demux of AV1 video (dav1d) + Opus audio (libopus).
+
+The two AV1 paths require the module built with dav1d (the default; ``DAS_VIDEO_DAV1D``).
 Returns a player handle, or ``null`` if the file can't be opened or has no decodable
 stream. Audio is **disabled** until you call ``video_enable_audio`` — the video-only
 paths carry no audio cost.
@@ -108,20 +114,27 @@ Audio (opt-in)
 
     video_has_audio(player : VideoPlayer?)      : bool   // does the file carry an audio stream?
     video_enable_audio(player : VideoPlayer?)   : bool   // enable it; false if there is none
-    video_audio_channels(player : VideoPlayer?) : int    // always 2 (pl_mpeg = interleaved stereo)
+    video_audio_channels(player : VideoPlayer?) : int    // interleaved channel count
 
 ``video_enable_audio`` must be called (once, after open) before decoding audio. It only
-enables a stream that exists, so the video-only paths never buffer audio packets.
+enables a stream that exists, so the video-only paths never buffer audio packets. The
+channel count is 2 for MPEG-1 (pl_mpeg is always interleaved stereo) and the Opus
+channel count (1 or 2) for WebM. ``video_samplerate`` is the MP2 rate for MPEG-1 and
+48000 Hz for WebM (Opus always decodes at 48 kHz).
 
 .. code-block:: das
 
     video_decode_audio(player : VideoPlayer?) : bool     // decode the next batch; false at end
     video_audio_time(player : VideoPlayer?)   : double   // pts of the current batch, seconds
-    video_audio_count(player : VideoPlayer?)  : int      // stereo frames in the batch (1152)
+    video_audio_count(player : VideoPlayer?)  : int      // frames per channel in the batch
+
+The batch size is fixed for MPEG-1 (1152 stereo frames) and varies for Opus (per the
+packet duration); always size the borrow against ``video_audio_count`` × the channel
+count.
 
 .. code-block:: das
 
-    // interleaved stereo floats (count*2), normalized -1..1, borrowed for the block only
+    // interleaved floats (count*channels), normalized -1..1, borrowed for the block only
     player |> get_audio_data() $(s : array<float>#) { ... }
 
 ``append_to_pcm`` (dasAudio) takes ownership of the array it's given, so **clone** the
