@@ -23,6 +23,13 @@ vendor/opus/
 *.log
 _smoke_*.das
 
+# tutorial recording intermediates (manual, local-only): only the committed .mp4 and
+# the record_*.das driver are tracked — the APNG / music bed / voiceover wavs are scratch
+tutorials/**/recording/*.apng
+tutorials/**/recording/*.wav
+tutorials/**/recording/voiceover/
+*.mp4.ffmpeg.txt
+
 # docs build artifacts
 __pycache__/
 *.pyc
