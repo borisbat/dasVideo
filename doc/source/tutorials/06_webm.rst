@@ -53,7 +53,7 @@ path:
 
 prints::
 
-   tutorial 06 ok: 453 AV1 frames, 905 Opus batches at 48000Hz
+   tutorial 06 ok: 467 AV1 frames, 933 Opus batches at 48000Hz
 
 The same ``examples/play_audio_gl.das`` from tutorial 05 plays this WebM on screen, with
 sound, A/V-synced — point it at ``tutorials/06_webm/sample.webm`` and watch. Because the
