@@ -96,7 +96,7 @@ def main : int {
     // everything below — open, decode, render — runs inside the load block.
     var rc = 0
     fopen(cfg.video, "rb") $(fh : file) {
-        fload(fh, sz) $(data : array<uint8>) {
+        fload(fh, int64(sz)) $(data : array<uint8>) {
             rc = run_cube(cfg, data)
         }
     }

@@ -42,7 +42,7 @@ def from_memory(path : string) : Decoded {
     let sz = int(stat(path).size)
     verify(sz > 0, "clip exists")
     fopen(path, "rb") $(f : file) {
-        fload(f, sz) $(data : array<uint8>) {
+        fload(f, int64(sz)) $(data : array<uint8>) {
             // reference the borrowed bytes (no copy); the buffer outlives the player
             var p = video_open(unsafe(addr(data[0])), length(data))
             verify(p != null, "open from the in-memory buffer")

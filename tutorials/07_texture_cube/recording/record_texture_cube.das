@@ -77,7 +77,7 @@ def main {
     }
     var ok = false
     fopen(clip, "rb") $(fh : file) {
-        fload(fh, sz) $(data : array<uint8>) {
+        fload(fh, int64(sz)) $(data : array<uint8>) {
             ok = render_and_capture(data, apng, n_frames, frame_ms)
         }
     }

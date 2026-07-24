@@ -13,7 +13,7 @@ def private decode_from_memory(path : string) : int {
     verify(sz > 0, "fixture exists and is non-empty")
     var frames = 0
     fopen(path, "rb") $(f : file) {
-        fload(f, sz) $(data : array<uint8>) {
+        fload(f, int64(sz)) $(data : array<uint8>) {
             verify(length(data) == sz, "the whole file loaded into the buffer")
             // reference the buffer (no copy); it outlives the player below
             var p = video_open(unsafe(addr(data[0])), length(data))
