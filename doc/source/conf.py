@@ -85,4 +85,6 @@ html_context = {
 }
 html_css_files = ['custom.css', 'custom-patch.css']
 
+html_js_files = ['sidebar.js']
+
 htmlhelp_basename = 'dasvideo_doc'
