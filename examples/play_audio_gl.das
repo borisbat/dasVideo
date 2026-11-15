@@ -134,23 +134,23 @@ def upload_frame(player : VideoPlayer?; vw, vh : int) {
     }
 }
 
-def read_consumed(status_box : LockBox?) : uint64 {
+def read_consumed(status_box : SeqBox?) : uint64 {
     var consumed = 0ul
-    status_box |> get() $(st : AudioChannelStatus#) {
+    status_box |> read() $(st : AudioChannelStatus) {
         consumed = st.consumed_position
     }
     return consumed
 }
 
-def read_que(status_box : LockBox?) : int {
+def read_que(status_box : SeqBox?) : int {
     var que = 0
-    status_box |> get() $(st : AudioChannelStatus#) {
+    status_box |> read() $(st : AudioChannelStatus) {
         que = st.stream_que_length
     }
     return que
 }
 
-def run_loop(player : VideoPlayer?; window : GLFWwindow?; cfg : PlayArgs; vw, vh : int; muted : bool; sid : uint64; status_box : LockBox?) {
+def run_loop(player : VideoPlayer?; window : GLFWwindow?; cfg : PlayArgs; vw, vh : int; muted : bool; sid : uint64; status_box : SeqBox?) {
     let rate = double(max(1, video_samplerate(player)))
     let fps = video_framerate(player)
     let frame_dur = fps > 0.0lf ? 1.0lf / fps : 1.0lf / 30.0lf
@@ -312,17 +312,12 @@ def main : int {
     } else {
         with_audio_system() {
             let sid = play_sound_from_pcm_stream(video_samplerate(player), 2)
-            var status_box = lock_box_create()
-            status_box |> add_ref()
+            var status_box = seq_box_create()
             set_status_update(sid, status_box)
             run_loop(player, window, cfg, vw, vh, false, sid, status_box)
-            // teardown: detach, drop our ref, wait for the audio thread, free
+            // teardown: detach, then drop our reference - the last holder frees the box
             unset_status_update(sid)
-            clear_status(status_box)
-            var box_ptr = status_box
-            status_box |> release()
-            box_ptr |> join()
-            unsafe(lock_box_remove(box_ptr))
+            status_box |> seq_box_release
         }
     }
     return 0
